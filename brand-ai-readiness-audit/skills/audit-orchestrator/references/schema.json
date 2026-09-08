@@ -1,0 +1,438 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://github.com/brand-ai-readiness-audit/schema/report.schema.json",
+	"title": "Brand AI Readiness Audit Report",
+	"description": "Canonical audit report emitted by the audit-orchestrator entrypoint. Superset of the Round 3 required floor: every required field from the problem statement is present, plus fields that carry the audit's reasoning (funnel stage, confidence, scope) and its epistemic limits (unverified checks).",
+	"type": "object",
+	"required": [
+		"site",
+		"audited_at",
+		"summary",
+		"findings"
+	],
+	"properties": {
+		"schema_version": {
+			"type": "string",
+			"const": "1.1.0",
+			"description": "Version of this report schema. Bump on any breaking field change."
+		},
+		"site": {
+			"type": "string",
+			"format": "uri",
+			"description": "Normalized target origin actually audited, after redirect resolution."
+		},
+		"audited_at": {
+			"type": "string",
+			"format": "date-time",
+			"description": "UTC ISO-8601 timestamp. Assigned once by the orchestrator, never by a specialist."
+		},
+		"audit": {
+			"type": "object",
+			"description": "Reproducibility metadata. Two runs with the same values here should produce the same findings.",
+			"required": [
+				"marketplace",
+				"marketplace_version",
+				"sample"
+			],
+			"properties": {
+				"marketplace": {
+					"type": "string"
+				},
+				"marketplace_version": {
+					"type": "string"
+				},
+				"skills_run": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"required": [
+							"id",
+							"status"
+						],
+						"properties": {
+							"id": {
+								"type": "string"
+							},
+							"status": {
+								"type": "string",
+								"enum": [
+									"success",
+									"partial_failure",
+									"failure",
+									"skipped"
+								]
+							},
+							"duration_ms": {
+								"type": "integer",
+								"minimum": 0
+							}
+						}
+					}
+				},
+				"sample": {
+					"type": "object",
+					"description": "The page sample every specialist audited. Shared, so findings are comparable across skills.",
+					"required": [
+						"strategy",
+						"pages_inspected",
+						"urls"
+					],
+					"properties": {
+						"strategy": {
+							"type": "string",
+							"description": "Human-readable description of the deterministic sampling rule applied."
+						},
+						"pages_inspected": {
+							"type": "integer",
+							"minimum": 0
+						},
+						"urls": {
+							"type": "array",
+							"items": {
+								"type": "string",
+								"format": "uri"
+							}
+						}
+					}
+				},
+				"environment": {
+					"type": "object",
+					"description": "Capabilities available at run time. Absence of a capability downgrades confidence, it never invents a finding.",
+					"properties": {
+						"rendering_available": {
+							"type": "boolean"
+						},
+						"network_available": {
+							"type": "boolean"
+						},
+						"effective_user_agent": {
+							"type": "string"
+						}
+					}
+				},
+				"duration_ms": {
+					"type": "integer",
+					"minimum": 0
+				}
+			}
+		},
+		"summary": {
+			"type": "object",
+			"required": [
+				"total_findings",
+				"critical",
+				"high",
+				"medium",
+				"low"
+			],
+			"properties": {
+				"total_findings": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"critical": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"high": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"medium": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"low": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"by_stage": {
+					"type": "object",
+					"description": "Counts keyed by funnel stage. Shows a reader where in the discovery funnel this site is losing.",
+					"additionalProperties": {
+						"type": "integer",
+						"minimum": 0
+					}
+				},
+				"limitations_count": {
+					"type": "integer",
+					"minimum": 0,
+					"description": "Number of checks that could not be verified. A non-zero value means the report is incomplete, not that the site is clean."
+				},
+				"headline": {
+					"type": "string",
+					"description": "One sentence a non-technical leader can act on. States the earliest blocking stage, not a finding count."
+				}
+			}
+		},
+		"findings": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": [
+					"id",
+					"title",
+					"severity",
+					"evidence",
+					"suggested_action"
+				],
+				"properties": {
+					"id": {
+						"type": "string",
+						"pattern": "^F[0-9]{3,}$",
+						"description": "Deterministic. Assigned by the orchestrator after dedup, in canonical sort order."
+					},
+					"title": {
+						"type": "string",
+						"minLength": 1,
+						"description": "States the defect, not the check. 'Product prices absent from server-rendered HTML', not 'Rendering check'."
+					},
+					"severity": {
+						"type": "string",
+						"enum": [
+							"critical",
+							"high",
+							"medium",
+							"low"
+						],
+						"description": "Computed by the orchestrator from severity_inputs via references/severity-model.md. Never chosen freehand."
+					},
+					"evidence": {
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "string"
+						},
+						"description": "Concrete observations only: URL inspected, response, what was present or absent, measurable counts. No interpretation."
+					},
+					"suggested_action": {
+						"type": "object",
+						"required": [
+							"summary",
+							"priority"
+						],
+						"properties": {
+							"summary": {
+								"type": "string",
+								"description": "What to change and how. Specific enough to hand to an engineer."
+							},
+							"priority": {
+								"type": "string",
+								"enum": [
+									"high",
+									"medium",
+									"low"
+								],
+								"description": "Fix order, not impact size. Derived from severity plus upstream-blocking status."
+							},
+							"rationale": {
+								"type": "string",
+								"description": "The causal mechanism: why this change makes the brand more findable, citable or engaging."
+							},
+							"effort": {
+								"type": "string",
+								"enum": [
+									"low",
+									"medium",
+									"high"
+								],
+								"description": "Rough implementation cost, so a leader can sequence quick wins."
+							},
+							"verify_by": {
+								"type": "string",
+								"description": "How to confirm the fix landed. Should be re-checkable by a later run of this same audit."
+							}
+						}
+					},
+					"stage": {
+						"type": "string",
+						"enum": [
+							"reachable",
+							"renderable",
+							"extractable",
+							"unambiguous",
+							"corroborated",
+							"current",
+							"engaging",
+							"actionable"
+						],
+						"description": "Earliest discovery-funnel stage at which this defect breaks the chain."
+					},
+					"category": {
+						"type": "string",
+						"enum": [
+							"access",
+							"crawl_policy",
+							"rendering",
+							"structured_data",
+							"machine_readability",
+							"entity_identity",
+							"freshness",
+							"corroboration",
+							"engagement_orientation",
+							"context_continuity",
+							"agent_actionability"
+						]
+					},
+					"confidence": {
+						"type": "string",
+						"enum": [
+							"high",
+							"medium",
+							"low"
+						],
+						"description": "high = directly observed. medium = inferred from a proxy signal because a capability was unavailable. low is not permitted on a finding; record it as a limitation instead."
+					},
+					"affected_urls": {
+						"type": "array",
+						"items": {
+							"type": "string",
+							"format": "uri"
+						}
+					},
+					"scope": {
+						"type": "string",
+						"enum": [
+							"site_wide",
+							"template",
+							"section",
+							"single_page"
+						],
+						"description": "Blast radius. Feeds the severity model."
+					},
+					"severity_inputs": {
+						"type": "object",
+						"description": "The three integers the severity model consumes. Published so any reader can recompute the severity by hand.",
+						"required": [
+							"stage_block",
+							"fact_criticality",
+							"blast_radius"
+						],
+						"properties": {
+							"stage_block": {
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 4
+							},
+							"fact_criticality": {
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 3
+							},
+							"blast_radius": {
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 3
+							},
+							"score": {
+								"type": "integer",
+								"minimum": 1,
+								"maximum": 36
+							}
+						}
+					},
+					"blocked_by": {
+						"type": [
+							"string",
+							"null"
+						],
+						"description": "Finding id of an upstream defect that prevents this one from being independently verified. Present only on findings the orchestrator chose to keep despite gating."
+					},
+					"source_skill": {
+						"type": "string",
+						"description": "Skill id that produced the underlying observations. Provenance, not blame."
+					}
+				}
+			}
+		},
+		"suppressed_findings": {
+			"type": "array",
+			"description": "Downstream checks that failed but were gated behind an upstream blocker. Kept visible so nothing is silently dropped, but excluded from severity counts to avoid double-reporting one root cause.",
+			"items": {
+				"type": "object",
+				"required": [
+					"title",
+					"blocked_by",
+					"reason"
+				],
+				"properties": {
+					"title": {
+						"type": "string"
+					},
+					"blocked_by": {
+						"type": "string"
+					},
+					"reason": {
+						"type": "string"
+					},
+					"stage": {
+						"type": "string"
+					}
+				}
+			}
+		},
+		"limitations": {
+			"type": "array",
+			"description": "Checks that could not be completed. Required for an honest report: a check that did not run is neither a defect nor a pass.",
+			"items": {
+				"type": "object",
+				"required": [
+					"skill",
+					"check",
+					"reason"
+				],
+				"properties": {
+					"skill": {
+						"type": "string"
+					},
+					"check": {
+						"type": "string"
+					},
+					"reason": {
+						"type": "string"
+					},
+					"affected_checks": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					}
+				}
+			}
+		},
+		"proactive_recommendations": {
+			"type": "array",
+			"description": "Improvements that strengthen discoverability or engagement where no defect was detected. Explicitly invited by the problem statement and scored separately from findings, so they are kept out of the findings array.",
+			"items": {
+				"type": "object",
+				"required": [
+					"title",
+					"summary",
+					"priority"
+				],
+				"properties": {
+					"title": {
+						"type": "string"
+					},
+					"summary": {
+						"type": "string"
+					},
+					"rationale": {
+						"type": "string"
+					},
+					"priority": {
+						"type": "string",
+						"enum": [
+							"high",
+							"medium",
+							"low"
+						]
+					},
+					"category": {
+						"type": "string"
+					}
+				}
+			}
+		}
+	}
+}

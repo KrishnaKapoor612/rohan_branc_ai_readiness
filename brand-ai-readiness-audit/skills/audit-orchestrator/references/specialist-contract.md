@@ -17,16 +17,26 @@ path in `marketplace.json`. Adding a specialist requires no orchestrator change.
 | Option | Default | Meaning |
 |---|---|---|
 | `<url>` | required | Target URL or bare domain |
-| `--user-agent` | marketplace bot string | UA used for policy evaluation and retrieval |
-| `--timeout` | `8.0` | Per-request timeout, seconds |
+| `--evidence-file` | none | Path to the shared `evidence.json` produced once by `audit-orchestrator/scripts/evidence.py`. The canonical specialist input. A specialist analyzes this file and does not independently fetch pages. |
+| `--user-agent` | marketplace bot string | Accepted for compatibility; collection (and therefore the effective UA) is owned by `evidence.py`, not by the specialist |
+| `--timeout` | `8.0` | Accepted for compatibility with specialists that still perform their own bounded verification requests (e.g. `sameAs` checks belong to evidence collection, not here) |
 | `--budget-ms` | `60000` | Wall-clock budget for this specialist. Must return before it elapses, degrading to limitations if needed |
-| `--sample-file` | none | Path to the shared page sample JSON. When present, the specialist audits these URLs and no others |
-| `--no-render` | off | Forbid headless rendering even if available |
+| `--sample-file` | none | **Deprecated.** The pre-evidence interface: a bare URL list with no page content. Retained only so a specialist that has not yet migrated does not fail argument parsing; new specialists should not read it |
+| `--no-render` | off | Accepted for compatibility. Whether rendering happens at all is decided once by `evidence.py`; a specialist reads `page.render` from the evidence file rather than requesting rendering itself |
 
-**Shared sample rule.** Every specialist audits the same page set. If a specialist
-selects its own pages, findings across skills stop being comparable and the audit stops
-being reproducible. `sitemap.py` produces the sample; the orchestrator passes it to
-everyone.
+**Shared evidence rule.** Every specialist analyzes the same `evidence.json`. If a
+specialist independently re-fetches a sampled page, findings across skills stop being
+comparable, network work is duplicated, and the audit stops being reproducible.
+`evidence.py` collects once; the orchestrator passes the same evidence file path to
+every specialist. See `evidence.json`'s schema, documented in `evidence.py`'s module
+docstring and reflected in each page object's fields (`status`, `robots_allowed`,
+`jsonld`, `open_graph`, `headings`, `links`, `date_signals`, `identity_signals`,
+`same_as`, `engagement_signals`, `page_structure`, `render`, `limitations`) plus
+`site_level` (`robots`, `sitemap`, `corroboration`) and top-level `limitations`.
+
+A specialist that receives no `--evidence-file`, or an evidence file with an empty
+`pages` array, must record a limitation and must not manufacture a finding from the
+absence of evidence.
 
 ---
 
@@ -134,12 +144,20 @@ not complete must appear here. Silence is not a pass.
 
 ## 7. Sibling module interfaces
 
-Scripts inside a specialist import each other as siblings. Each exposes one function.
+`robots.py`, `fetch.py`, `render.py` and `sitemap.py` now live under
+`audit-orchestrator/scripts/` and are siblings of `evidence.py` only. No specialist
+imports them directly any more; a specialist's `check.py` reads their output
+secondhand, through `evidence.json`. This is what stops network collection logic (and
+network calls) from being duplicated across skills.
 
 ```python
 # robots.py
 check_robots(url, user_agent=..., timeout=..., ai_agents=None) -> dict
 normalize_url(raw_url) -> str
+fetch_robots_txt(robots_url, user_agent=..., timeout=...) -> FetchResult
+parse_robots_txt(text) -> ParsedRobots
+select_group(groups, user_agent) -> Optional[Group]
+evaluate_path(group, path) -> tuple[bool, Optional[Rule]]
 
 # fetch.py
 fetch_page(url, user_agent=..., timeout=..., max_bytes=...) -> dict
@@ -152,12 +170,20 @@ render_page(url, timeout=...) -> dict
 #   -> available: bool, outcome, html, text, error, duration_ms
 
 # sitemap.py
-discover(url, declared_sitemaps, limit=...) -> dict
-#   -> sitemaps, url_count, sample_urls, truncated, limitations
+discover(url, declared_sitemaps, limit=..., timeout=..., user_agent=...) -> dict
+#   -> sitemaps, url_count, sample, truncated, sample_strategy, limitations
 ```
 
-A missing sibling module is **not** an error. `check.py` records a limitation and
-continues with the checks it can still perform.
+`evidence.py` calls `robots.fetch_robots_txt()` and `robots.parse_robots_txt()` exactly
+once per audit, then reuses the parsed rules to evaluate every sampled URL's
+`robots_allowed` via `select_group()`/`evaluate_path()`, and passes the resulting
+declared sitemaps into `sitemap.discover()` directly. This is what keeps robots.txt to a
+single fetch per audit regardless of sample size.
+
+A missing sibling module is **not** an error. `evidence.py` records a collection
+limitation and continues with what it can still collect; a specialist reading a
+resulting gap in `evidence.json` records its own limitation rather than treating the
+gap as either a defect or a pass.
 
 ---
 

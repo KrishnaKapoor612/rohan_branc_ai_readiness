@@ -1,41 +1,31 @@
 #!/usr/bin/env python3
 """
-check.py -- specialist coordinator for the crawl-render-audit skill.
+check.py -- evidence-only specialist for the crawl-render-audit skill.
 
-Implements the marketplace specialist contract
-(see references/specialist-contract.md).
+This specialist consumes the canonical evidence.json produced by
+audit-orchestrator/scripts/evidence.py.
 
-Responsibilities:
-    1. Run the robots.txt permission check before anything else.
-    2. Retrieve the target only where permission allows it.
-    3. Analyse what a non-executing machine reader can actually extract.
-    4. Compare server HTML against rendered content where a renderer exists.
-    5. Emit one specialist result object: observations, findings, limitations.
+Collector collects. Specialist reasons.
 
 This module does NOT:
-    - assign severity labels (it emits severity_inputs; the orchestrator scores);
+    - make network requests;
+    - import fetch.py, robots.py, render.py or sitemap.py;
+    - parse raw HTML again;
+    - assign severity labels;
     - assign global finding IDs;
-    - bypass any access control;
-    - modify the target site in any way;
-    - treat an unavailable check as either a defect or a pass.
+    - modify the target site.
 
-Sibling modules (robots.py, fetch.py, render.py, sitemap.py) are optional at run
-time. A missing sibling becomes a limitation, never a crash and never a finding.
-
-All operations are read-only and bounded.
+It emits one specialist result object to stdout.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import re
-import sys
 import time
-from html.parser import HTMLParser
 from typing import Any, Optional
+
 
 SKILL_ID = "crawl-render-audit"
 
@@ -46,183 +36,8 @@ DEFAULT_USER_AGENT = (
 
 DEFAULT_TIMEOUT_SECONDS = 8.0
 DEFAULT_BUDGET_MS = 60_000
-
-# Body text below this many characters in the server response, on a page that
-# ships a hydration payload, indicates the page is assembled client-side.
 THIN_TEXT_CHARS = 600
 
-# Markers that a page's content is produced by client-side execution.
-HYDRATION_MARKERS = (
-    "__NEXT_DATA__",
-    "__NUXT__",
-    "__INITIAL_STATE__",
-    "__APOLLO_STATE__",
-    "window.__data",
-    "ng-version",
-    "data-reactroot",
-)
-
-
-# ---------------------------------------------------------------------------
-# Sibling module loading
-# ---------------------------------------------------------------------------
-
-def load_sibling(module_name: str) -> tuple[Optional[Any], Optional[str]]:
-    """
-    Import a sibling script from this skill's scripts/ directory.
-
-    Returns (module, None) on success and (None, reason) on failure. The reason
-    is carried into the audit limitation so that a genuine import error is never
-    mistaken for a module that was simply not written yet.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, f"{module_name}.py")
-
-    if not os.path.isfile(path):
-        return None, f"{module_name}.py is not present at {path}."
-
-    try:
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            return None, f"{module_name}.py could not be loaded as a module."
-        module = importlib.util.module_from_spec(spec)
-        # Required before exec_module: modules that combine `from __future__
-        # import annotations` with @dataclass resolve their annotations through
-        # sys.modules[cls.__module__], which raises if the module is absent.
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        return module, None
-    except Exception as exc:
-        return None, f"{module_name}.py failed to import: {type(exc).__name__}: {exc}"
-
-
-# ---------------------------------------------------------------------------
-# Minimal HTML text extraction (stdlib only)
-# ---------------------------------------------------------------------------
-
-class _TextExtractor(HTMLParser):
-    """Collects visible text, ignoring script and style content."""
-
-    SKIP = {"script", "style", "noscript", "template", "svg"}
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.chunks: list[str] = []
-        self._depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list) -> None:
-        if tag in self.SKIP:
-            self._depth += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self.SKIP and self._depth > 0:
-            self._depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if self._depth == 0:
-            stripped = data.strip()
-            if stripped:
-                self.chunks.append(stripped)
-
-    def text(self) -> str:
-        return " ".join(self.chunks)
-
-
-def visible_text(html: str) -> str:
-    parser = _TextExtractor()
-    try:
-        parser.feed(html)
-    except Exception:
-        # Malformed markup: fall back to a crude strip rather than failing the run.
-        return re.sub(r"<[^>]+>", " ", html)
-    return parser.text()
-
-
-def analyze_html(html: str) -> dict:
-    """
-    Describe what a non-executing reader can extract from a server response.
-
-    Returns observations only. Interpretation happens in the caller, so that
-    this function stays reusable and testable without network access.
-    """
-    text = visible_text(html)
-
-    title_match = re.search(
-        r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL
-    )
-    title = title_match.group(1).strip() if title_match else None
-
-    desc_match = re.search(
-        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    )
-    description = desc_match.group(1).strip() if desc_match else None
-
-    ld_blocks = re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    ld_valid = 0
-    ld_invalid = 0
-    ld_types: list[str] = []
-
-    for block in ld_blocks:
-        try:
-            parsed = json.loads(block.strip())
-        except Exception:
-            ld_invalid += 1
-            continue
-        ld_valid += 1
-        for node in parsed if isinstance(parsed, list) else [parsed]:
-            if isinstance(node, dict):
-                node_type = node.get("@type")
-                if isinstance(node_type, str):
-                    ld_types.append(node_type)
-                elif isinstance(node_type, list):
-                    ld_types.extend(t for t in node_type if isinstance(t, str))
-
-    canonical = re.search(
-        r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](.*?)["\']',
-        html,
-        re.IGNORECASE,
-    )
-
-    images = re.findall(r"<img\b[^>]*>", html, re.IGNORECASE)
-    images_without_alt = [
-        tag for tag in images
-        if not re.search(r'\balt\s*=\s*["\'][^"\']+["\']', tag, re.IGNORECASE)
-    ]
-
-    markers = [m for m in HYDRATION_MARKERS if m in html]
-
-    return {
-        "title": title,
-        "meta_description": description,
-        "text_chars": len(text),
-        "h1_count": len(re.findall(r"<h1\b", html, re.IGNORECASE)),
-        "h2_count": len(re.findall(r"<h2\b", html, re.IGNORECASE)),
-        "jsonld_blocks": len(ld_blocks),
-        "jsonld_parseable": ld_valid,
-        "jsonld_unparseable": ld_invalid,
-        "jsonld_types": sorted(set(ld_types)),
-        "canonical": canonical.group(1) if canonical else None,
-        "image_count": len(images),
-        "images_without_alt": len(images_without_alt),
-        "hydration_markers": markers,
-        "html_bytes": len(html),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Finding construction
-# ---------------------------------------------------------------------------
 
 def finding(
     local_id: str,
@@ -249,7 +64,7 @@ def finding(
         "stage": stage,
         "confidence": confidence,
         "scope": scope,
-        "affected_urls": sorted(affected_urls),
+        "affected_urls": sorted(set(affected_urls)),
         "evidence": evidence,
         "severity_inputs": {
             "stage_block": stage_block,
@@ -265,478 +80,595 @@ def finding(
     }
 
 
-def radius_from_rule_path(path: Optional[str]) -> tuple[int, str]:
-    """A disallow on / is site-wide; a disallow on a subtree is a section."""
-    if path in (None, "", "/"):
-        return 3, "site_wide"
-    return 2, "section"
+def load_evidence(path: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Load the canonical evidence document.
+
+    Returns (document, error). No network access occurs here.
+    """
+    if not path:
+        return None, "No --evidence-file was supplied."
+
+    if not os.path.isfile(path):
+        return None, f"Evidence file was not found at {path}."
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except Exception as exc:
+        return None, (
+            f"Could not read evidence.json: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    if not isinstance(document, dict):
+        return None, "Evidence file does not contain a JSON object."
+
+    return document, None
 
 
-# ---------------------------------------------------------------------------
-# Stage 1 -- crawl permission
-# ---------------------------------------------------------------------------
+def stage_robots(evidence: dict, state: dict) -> None:
+    """Reason about robots evidence already collected by evidence.py."""
 
-def stage_robots(url: str, user_agent: str, timeout: float, state: dict) -> Optional[dict]:
-    robots, load_error = load_sibling("robots")
+    site_level = evidence.get("site_level") or {}
+    robots = site_level.get("robots") or {}
+    pages = evidence.get("pages") or []
 
-    if robots is None:
+    if not robots:
         state["limitations"].append({
             "check": "robots_policy",
-            "reason": load_error or "robots.py is unavailable.",
-            "affected_checks": ["crawl_permission", "ai_agent_directives", "sitemap_discovery"],
+            "reason": "Shared evidence contains no site-level robots data.",
+            "affected_checks": [
+                "crawl_permission",
+                "ai_agent_directives",
+            ],
         })
         state["status"] = "partial_failure"
-        return None
+        return
 
-    result = robots.check_robots(url=url, user_agent=user_agent, timeout=timeout)
-
-    state["observations"].extend(result.get("observations", []))
-    for text in result.get("limitations", []):
+    if not robots.get("retrieved"):
+        reason = robots.get("reason") or (
+            "robots.txt was not retrieved successfully."
+        )
         state["limitations"].append({
             "check": "robots_policy",
-            "reason": text,
-            "affected_checks": ["crawl_permission"],
+            "reason": reason,
+            "affected_checks": [
+                "crawl_permission",
+                "ai_agent_directives",
+            ],
         })
+        state["status"] = "partial_failure"
 
-    permission = result.get("crawl_permission")
-    robots_url = result.get("robots_url")
+    http_status = robots.get("http_status")
+    robots_url = robots.get("robots_url")
 
-    # Finding: the audit's own user agent is disallowed on the target path.
-    if permission == "disallowed":
-        rule = result.get("matched_rule") or {}
-        radius, scope = radius_from_rule_path(rule.get("path"))
+    if robots.get("retrieved"):
+        state["observations"].append(
+            f"robots.txt at {robots_url} returned HTTP {http_status}."
+        )
+
+    # Page-level robots decisions are authoritative for the sampled URLs.
+    disallowed_pages = [
+        page for page in pages
+        if page.get("robots_allowed") is False
+    ]
+
+    if disallowed_pages:
+        affected_urls = sorted(
+            page.get("url")
+            for page in disallowed_pages
+            if page.get("url")
+        )
+
         state["findings"].append(finding(
             local_id="CR-001",
-            title="Target path is disallowed by robots.txt for general crawlers",
+            title="Sampled page paths are disallowed by robots.txt",
             category="crawl_policy",
             stage="reachable",
             evidence=[
-                f"robots.txt at {robots_url} returned HTTP {result.get('robots_http_status')}.",
-                f"Matched rule: {json.dumps(rule, sort_keys=True)}",
-                f"Evaluated path: {result.get('input_url')}",
+                f"{url}: robots_allowed=false."
+                for url in affected_urls
             ],
             stage_block=4,
             fact_criticality=3,
-            blast_radius=radius,
-            scope=scope,
-            affected_urls=[result.get("input_url", url)],
+            blast_radius=2 if len(affected_urls) > 1 else 1,
+            scope="section" if len(affected_urls) > 1 else "single_page",
+            affected_urls=affected_urls,
             action_summary=(
-                "Narrow the Disallow rule so that content intended for public "
-                "discovery is crawlable, keeping only genuinely private paths blocked."
+                "Allow publicly discoverable paths in robots.txt while "
+                "keeping genuinely private paths blocked."
             ),
             action_rationale=(
-                "A crawler that is refused entry never reaches the later stages of "
-                "discovery. No amount of on-page quality can compensate, because the "
-                "page is never read."
+                "A crawler that is refused access cannot reach the later "
+                "stages of discovery."
             ),
             effort="low",
-            verify_by="Re-run this audit and confirm crawl_permission resolves to allowed.",
+            verify_by=(
+                "Re-run the audit and confirm the affected sampled paths "
+                "have robots_allowed=true."
+            ),
         ))
 
-    # Finding: assistant-operated crawlers are specifically excluded.
+    ai_directives = robots.get("ai_agent_directives") or []
     blocked_agents = [
-        entry for entry in result.get("ai_agent_directives", [])
+        entry for entry in ai_directives
         if entry.get("crawl_allowed") is False
     ]
 
     if blocked_agents:
-        paths = {
-            (entry.get("matched_rule") or {}).get("path")
+        names = sorted(
+            str(entry.get("agent"))
             for entry in blocked_agents
-        }
-        radius, scope = (3, "site_wide") if paths & {None, "", "/"} else (2, "section")
-        names = sorted(entry["agent"] for entry in blocked_agents)
+            if entry.get("agent")
+        )
+
+        evidence_lines = [
+            f"AI crawler token {name} is recorded as crawl_allowed=false."
+            for name in names
+        ]
+
+        for entry in blocked_agents:
+            rule = entry.get("matched_rule")
+            if rule:
+                evidence_lines.append(
+                    f"{entry.get('agent')}: "
+                    f"{json.dumps(rule, sort_keys=True)}"
+                )
 
         state["findings"].append(finding(
             local_id="CR-002",
-            title="Crawlers operated by AI assistants are disallowed by robots.txt",
+            title="AI assistant crawlers are disallowed by robots.txt",
             category="crawl_policy",
             stage="reachable",
-            evidence=[
-                f"robots.txt at {robots_url} returned HTTP {result.get('robots_http_status')}.",
-                f"Disallowed agent tokens: {', '.join(names)}.",
-                f"Matching rules: {json.dumps(sorted((e.get('matched_rule') or {}).get('path') or '/' for e in blocked_agents))}",
-            ],
+            evidence=evidence_lines,
             stage_block=4,
             fact_criticality=3,
-            blast_radius=radius,
-            scope=scope,
-            affected_urls=[result.get("input_url", url)],
+            blast_radius=3,
+            scope="site_wide",
+            affected_urls=[
+                evidence.get("site") or ""
+            ],
             action_summary=(
-                "Allow the assistant crawler tokens on public marketing, product and "
-                "support paths. Keep account, checkout and internal search paths blocked."
+                "Review robots.txt rules for assistant crawler tokens and "
+                "allow access to public content intended for discovery."
             ),
             action_rationale=(
-                "Assistants build answers from pages they are permitted to fetch. A "
-                "token-level disallow removes the brand from the candidate set before "
-                "any ranking or quality judgement happens, which is the most complete "
-                "form of invisibility available."
+                "A crawler that cannot retrieve public content cannot use "
+                "that content when constructing answers."
             ),
             effort="low",
             verify_by=(
-                "Re-run this audit and confirm no assistant token resolves to "
-                "crawl_allowed false on public paths."
+                "Re-run the audit and confirm the affected AI crawler "
+                "tokens are no longer recorded as disallowed."
             ),
         ))
 
-    # Sitemap discovery is an observation, not a defect on its own.
-    sitemaps = result.get("sitemaps", [])
-    if sitemaps:
-        state["observations"].append(
-            f"robots.txt declares {len(sitemaps)} sitemap location(s)."
-        )
-    else:
-        state["observations"].append(
-            "robots.txt declares no Sitemap: location. Not a defect by itself; "
-            "page reachability through crawlable links is checked separately."
-        )
 
-    return result
+def stage_retrieval(evidence: dict, state: dict) -> None:
+    """Reason about page retrieval outcomes already collected."""
 
+    pages = evidence.get("pages") or []
 
-# ---------------------------------------------------------------------------
-# Stage 2 -- retrieval
-# ---------------------------------------------------------------------------
-
-def stage_fetch(url: str, user_agent: str, timeout: float, state: dict) -> Optional[dict]:
-    fetch, load_error = load_sibling("fetch")
-
-    if fetch is None:
+    if not pages:
         state["limitations"].append({
             "check": "http_retrieval",
-            "reason": load_error or "fetch.py is unavailable.",
+            "reason": "No page evidence was collected.",
             "affected_checks": [
                 "server_html_extractability",
-                "structured_data_presence",
                 "render_diff",
             ],
         })
         state["status"] = "partial_failure"
-        return None
+        return
 
-    result = fetch.fetch_page(url, user_agent=user_agent, timeout=timeout)
+    failed_pages = [
+        page for page in pages
+        if page.get("status") is not None
+        and not page.get("html")
+        and (
+            page.get("error")
+            or page.get("limitations")
+        )
+    ]
 
-    state["observations"].append(
-        f"Retrieval of {url}: outcome={result.get('outcome')} "
-        f"status={result.get('http_status')} "
-        f"bytes={result.get('bytes')} "
-        f"duration_ms={result.get('duration_ms')}"
-    )
+    for page in failed_pages:
+        url = page.get("url", "")
+        error = page.get("error") or {}
+        message = (
+            error.get("message")
+            if isinstance(error, dict)
+            else str(error)
+        )
 
-    if result.get("outcome") != "retrieved":
         state["limitations"].append({
             "check": "http_retrieval",
             "reason": (
-                f"Target returned outcome={result.get('outcome')} "
-                f"status={result.get('http_status')} "
-                f"error={result.get('error')} from this audit environment. "
-                "This does not establish that the site is unreachable for all clients."
+                f"Page evidence for {url} was unavailable: "
+                f"{message or 'no HTML evidence was collected'}."
             ),
-            "affected_checks": ["server_html_extractability", "render_diff"],
+            "affected_checks": [
+                "server_html_extractability",
+                "render_diff",
+            ],
         })
+
+    if failed_pages:
         state["status"] = "partial_failure"
-        return None
 
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Stage 3 -- extractability of the server response
-# ---------------------------------------------------------------------------
-
-def stage_extractability(url: str, html: str, state: dict) -> dict:
-    analysis = analyze_html(html)
-
-    state["observations"].append(
-        "Server HTML analysis: " + json.dumps(analysis, sort_keys=True)
-    )
-
-    # Client-side dependence, inferred without a renderer.
-    if analysis["text_chars"] < THIN_TEXT_CHARS and analysis["hydration_markers"]:
-        state["findings"].append(finding(
-            local_id="CR-003",
-            title="Page content is assembled client-side and is absent from the server response",
-            category="rendering",
-            stage="renderable",
-            evidence=[
-                f"{url} returned {analysis['html_bytes']} bytes of HTML "
-                f"containing only {analysis['text_chars']} characters of extractable text.",
-                f"Client-side hydration markers present: {', '.join(analysis['hydration_markers'])}.",
-            ],
-            stage_block=3,
-            fact_criticality=3,
-            blast_radius=1,
-            scope="single_page",
-            affected_urls=[url],
-            action_summary=(
-                "Server-render or pre-render the primary content of this page so the "
-                "facts are present in the initial HTML response."
-            ),
-            action_rationale=(
-                "Readers that do not execute JavaScript receive a shell. Any fact that "
-                "only exists after hydration cannot be quoted, because it was never "
-                "part of the document the reader received."
-            ),
-            effort="high",
-            verify_by=(
-                "Fetch the URL without JavaScript execution and confirm the key facts "
-                "appear in the response body."
-            ),
-            confidence="medium",
-        ))
-
-    # Structured data.
-    if analysis["jsonld_blocks"] == 0:
-        state["findings"].append(finding(
-            local_id="CR-004",
-            title="No structured data present on the inspected page",
-            category="structured_data",
-            stage="extractable",
-            evidence=[
-                f"{url}: 0 application/ld+json blocks found in the server response.",
-                f"Page carries a title ({bool(analysis['title'])}) and "
-                f"{analysis['h1_count']} h1 element(s), so content exists but is unlabelled.",
-            ],
-            stage_block=2,
-            fact_criticality=3,
-            blast_radius=1,
-            scope="single_page",
-            affected_urls=[url],
-            action_summary=(
-                "Add schema.org JSON-LD describing what this page is about. Use "
-                "Organization on the home page and Product with an Offer, including "
-                "price, priceCurrency and availability, on product pages."
-            ),
-            action_rationale=(
-                "Structured data states a fact unambiguously and in one place, which "
-                "is what a machine extracts reliably. Prose requires inference; a "
-                "labelled field does not."
-            ),
-            effort="medium",
-            verify_by="Re-run this audit and confirm parseable JSON-LD is detected.",
-        ))
-    elif analysis["jsonld_unparseable"] > 0:
-        state["findings"].append(finding(
-            local_id="CR-005",
-            title="Structured data is present but not parseable",
-            category="structured_data",
-            stage="extractable",
-            evidence=[
-                f"{url}: {analysis['jsonld_unparseable']} of {analysis['jsonld_blocks']} "
-                "ld+json blocks failed JSON parsing.",
-                f"Parseable types found: {', '.join(analysis['jsonld_types']) or 'none'}.",
-            ],
-            stage_block=2,
-            fact_criticality=3,
-            blast_radius=1,
-            scope="single_page",
-            affected_urls=[url],
-            action_summary=(
-                "Fix the malformed JSON-LD blocks. Validate output at build time so "
-                "template changes cannot silently break the markup."
-            ),
-            action_rationale=(
-                "Invalid markup is discarded silently by consumers. The effort of "
-                "adding structured data is spent, but none of the benefit is received."
-            ),
-            effort="low",
-            verify_by="Re-run this audit and confirm jsonld_unparseable is 0.",
-        ))
-
-    # Document identity.
-    if not analysis["title"]:
-        state["findings"].append(finding(
-            local_id="CR-006",
-            title="Page has no title element",
-            category="machine_readability",
-            stage="extractable",
-            evidence=[f"{url}: no non-empty <title> element in the server response."],
-            stage_block=2,
-            fact_criticality=3,
-            blast_radius=1,
-            scope="single_page",
-            affected_urls=[url],
-            action_summary=(
-                "Give every page a unique title stating the entity and the page's "
-                "subject, for example 'Velocity X9 Running Shoes | Garuda Footwear'."
-            ),
-            action_rationale=(
-                "The title is the shortest unambiguous statement of what a document is "
-                "about, and is weighted heavily when a system decides whether a page "
-                "answers a question."
-            ),
-            effort="low",
-            verify_by="Re-run this audit and confirm a title is detected.",
-        ))
-
-    return analysis
+    for page in pages:
+        if page.get("status") is not None:
+            state["observations"].append(
+                f"Retrieved {page.get('url')}: "
+                f"HTTP {page.get('status')}, "
+                f"content_type={page.get('content_type')}."
+            )
 
 
-# ---------------------------------------------------------------------------
-# Stage 4 -- render comparison
-# ---------------------------------------------------------------------------
+def stage_extractability(evidence: dict, state: dict) -> None:
+    """Reason about already-normalized page evidence."""
 
-def stage_render(url: str, server_analysis: dict, timeout: float, allow: bool, state: dict) -> None:
-    if not allow:
-        state["limitations"].append({
-            "check": "render_diff",
-            "reason": "Rendering was disabled for this run by --no-render.",
-            "affected_checks": ["client_side_content_dependence"],
-        })
-        return
+    pages = evidence.get("pages") or []
 
-    render, load_error = load_sibling("render")
+    for page in pages:
+        url = page.get("url", "")
+        page_structure = page.get("page_structure") or {}
+        jsonld = page.get("jsonld") or []
+        title = page.get("title")
 
-    if render is None:
+        if not page.get("html"):
+            continue
+
+        text_chars = page_structure.get("text_chars", 0)
+        hydration_markers = page_structure.get(
+            "hydration_markers", []
+        )
+
+        # A thin server response plus explicit hydration markers is a
+        # useful signal, but without rendered evidence it remains medium
+        # confidence.
+        if text_chars < THIN_TEXT_CHARS and hydration_markers:
+            state["findings"].append(finding(
+                local_id=f"CR-003-{len(state['findings']) + 1}",
+                title=(
+                    "Page content appears dependent on client-side rendering"
+                ),
+                category="rendering",
+                stage="renderable",
+                evidence=[
+                    f"{url}: server response contains "
+                    f"{text_chars} characters of extractable text.",
+                    "Hydration markers: "
+                    + ", ".join(sorted(hydration_markers)),
+                ],
+                stage_block=3,
+                fact_criticality=3,
+                blast_radius=1,
+                scope="single_page",
+                affected_urls=[url],
+                action_summary=(
+                    "Server-render the primary content or expose the key "
+                    "facts in the initial HTML response."
+                ),
+                action_rationale=(
+                    "A non-executing reader cannot quote facts that only "
+                    "appear after client-side execution."
+                ),
+                effort="high",
+                verify_by=(
+                    "Re-run the audit and confirm the key content is "
+                    "present in the initial HTML response."
+                ),
+                confidence="medium",
+            ))
+
+        unparseable = [
+            block for block in jsonld
+            if block.get("parsed") is False
+        ]
+
+        if unparseable:
+            state["findings"].append(finding(
+                local_id=f"CR-004-{len(state['findings']) + 1}",
+                title="Structured data is present but not parseable",
+                category="structured_data",
+                stage="extractable",
+                evidence=[
+                    f"{url}: {len(unparseable)} JSON-LD block(s) "
+                    "were recorded as unparseable."
+                ],
+                stage_block=2,
+                fact_criticality=3,
+                blast_radius=1,
+                scope="single_page",
+                affected_urls=[url],
+                action_summary=(
+                    "Fix malformed JSON-LD and validate the generated "
+                    "markup before deployment."
+                ),
+                action_rationale=(
+                    "Invalid structured data cannot be reliably consumed "
+                    "by machine readers."
+                ),
+                effort="low",
+                verify_by=(
+                    "Re-run the audit and confirm all JSON-LD blocks "
+                    "are parseable."
+                ),
+            ))
+
+        # Absence of JSON-LD is deliberately NOT a finding.
+        # It is an observation only because structured data is useful but
+        # not universally required for AI discoverability.
+        if not jsonld:
+            state["observations"].append(
+                f"{url}: no JSON-LD evidence was collected. "
+                "This is not treated as a defect by itself."
+            )
+
+        if not title:
+            state["findings"].append(finding(
+                local_id=f"CR-005-{len(state['findings']) + 1}",
+                title="Page has no title element",
+                category="machine_readability",
+                stage="extractable",
+                evidence=[
+                    f"{url}: no non-empty title was recorded."
+                ],
+                stage_block=2,
+                fact_criticality=3,
+                blast_radius=1,
+                scope="single_page",
+                affected_urls=[url],
+                action_summary=(
+                    "Give the page a unique title describing the entity "
+                    "and subject of the page."
+                ),
+                action_rationale=(
+                    "A page title provides a concise machine-readable "
+                    "statement of the document's subject."
+                ),
+                effort="low",
+                verify_by=(
+                    "Re-run the audit and confirm a non-empty title "
+                    "is recorded."
+                ),
+            ))
+
+
+def stage_render(evidence: dict, state: dict, render_allowed: bool) -> None:
+    """Reason about render evidence already collected."""
+
+    if not render_allowed:
         state["limitations"].append({
             "check": "render_diff",
             "reason": (
-                f"{load_error or 'render.py is unavailable.'} Client-side content dependence was "
-                "inferred from hydration markers instead of observed, so any related "
-                "finding is reported at medium confidence."
+                "Rendering was disabled for this run by --no-render."
             ),
-            "affected_checks": ["client_side_content_dependence"],
+            "affected_checks": [
+                "client_side_content_dependence"
+            ],
         })
-        state["status"] = "partial_failure"
         return
 
-    result = render.render_page(url, timeout=timeout)
+    pages = evidence.get("pages") or []
 
-    if not result.get("available") or result.get("outcome") != "rendered":
+    render_evidence_seen = False
+
+    for page in pages:
+        render = page.get("render") or {}
+
+        if not render:
+            continue
+
+        render_evidence_seen = True
+
+        if not render.get("attempted"):
+            continue
+
+        if not render.get("available"):
+            state["limitations"].append({
+                "check": "render_diff",
+                "reason": (
+                    f"Rendered evidence was unavailable for "
+                    f"{page.get('url', '')}."
+                ),
+                "affected_checks": [
+                    "client_side_content_dependence"
+                ],
+            })
+            state["status"] = "partial_failure"
+            continue
+
+        signals = render.get("signals") or {}
+        server_chars = signals.get("server_text_chars")
+        rendered_chars = signals.get("text_chars")
+        gained = signals.get("gained_chars")
+
+        if not isinstance(server_chars, int):
+            continue
+        if not isinstance(rendered_chars, int):
+            continue
+        if not isinstance(gained, int):
+            continue
+
+        state["observations"].append(
+            f"Render comparison for {page.get('url', '')}: "
+            f"server={server_chars}, rendered={rendered_chars}, "
+            f"gained={gained}."
+        )
+
+        if (
+            server_chars > 0
+            and rendered_chars >= server_chars * 3
+            and gained > THIN_TEXT_CHARS
+        ):
+            state["findings"].append(finding(
+                local_id=f"CR-006-{len(state['findings']) + 1}",
+                title=(
+                    "Most page content appears only after client-side rendering"
+                ),
+                category="rendering",
+                stage="renderable",
+                evidence=[
+                    f"{page.get('url', '')}: server response contained "
+                    f"{server_chars} characters of extractable text; "
+                    f"rendered content contained {rendered_chars}.",
+                    f"{gained} additional characters appeared after "
+                    "rendering."
+                ],
+                stage_block=3,
+                fact_criticality=3,
+                blast_radius=1,
+                scope="single_page",
+                affected_urls=[page.get("url", "")],
+                action_summary=(
+                    "Server-render the primary content or expose key facts "
+                    "in the initial HTML response."
+                ),
+                action_rationale=(
+                    "Content added only after execution may be unavailable "
+                    "to readers that do not execute JavaScript."
+                ),
+                effort="high",
+                verify_by=(
+                    "Re-run the audit and confirm the server and rendered "
+                    "content are substantially closer."
+                ),
+                confidence="high",
+            ))
+
+    if pages and not render_evidence_seen:
         state["limitations"].append({
             "check": "render_diff",
             "reason": (
-                f"Rendering did not complete: {result.get('error') or result.get('outcome')}. "
-                "Rendered content could not be verified."
+                "No render evidence was available in the shared evidence."
             ),
-            "affected_checks": ["client_side_content_dependence"],
+            "affected_checks": [
+                "client_side_content_dependence"
+            ],
         })
         state["status"] = "partial_failure"
-        return
 
-    rendered_analysis = analyze_html(result.get("html", ""))
-    server_chars = server_analysis["text_chars"]
-    rendered_chars = rendered_analysis["text_chars"]
-    gained = rendered_chars - server_chars
 
-    state["observations"].append(
-        f"Render comparison for {url}: server text {server_chars} chars, "
-        f"rendered text {rendered_chars} chars, difference {gained}."
-    )
+def finalize(state: dict) -> dict:
+    """Return deterministic specialist output."""
 
-    # Only a large proportional gap indicates the server response is a shell.
-    if server_chars > 0 and rendered_chars >= server_chars * 3 and gained > THIN_TEXT_CHARS:
-        state["findings"].append(finding(
-            local_id="CR-007",
-            title="Most page content appears only after client-side rendering",
-            category="rendering",
-            stage="renderable",
-            evidence=[
-                f"{url}: server response contained {server_chars} characters of "
-                f"extractable text; rendered document contained {rendered_chars}.",
-                f"{gained} characters of content are unavailable to a reader that "
-                "does not execute JavaScript.",
-            ],
-            stage_block=3,
-            fact_criticality=3,
-            blast_radius=1,
-            scope="single_page",
-            affected_urls=[url],
-            action_summary=(
-                "Server-render the primary content, or emit the same facts as JSON-LD "
-                "in the initial response so they survive without execution."
+    return {
+        "skill": SKILL_ID,
+        "status": state["status"],
+        "observations": sorted(state["observations"]),
+        "findings": sorted(
+            state["findings"],
+            key=lambda item: item["local_id"],
+        ),
+        "limitations": sorted(
+            state["limitations"],
+            key=lambda item: (
+                item.get("check", ""),
+                item.get("reason", ""),
             ),
-            action_rationale=(
-                "The gap between the two documents is exactly the set of facts that "
-                "cannot be cited. Closing it is what makes the page quotable."
-            ),
-            effort="high",
-            verify_by=(
-                "Re-run this audit and confirm the server and rendered text lengths "
-                "are within the same order of magnitude."
-            ),
-        ))
+        ),
+        "proactive_recommendations": [],
+    }
 
 
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
-
-def run(url: str, user_agent: str, timeout: float, allow_render: bool) -> dict:
-    state: dict = {
+def run(
+    evidence: dict,
+    allow_render: bool,
+) -> dict:
+    state = {
         "status": "success",
         "observations": [],
         "findings": [],
         "limitations": [],
     }
 
-    robots_result = stage_robots(url, user_agent, timeout, state)
+    pages = evidence.get("pages")
 
-    permission = (robots_result or {}).get("crawl_permission")
-    target = (robots_result or {}).get("input_url", url)
-
-    if robots_result is None:
-        # Permission unknown because the check itself was unavailable.
+    if not isinstance(pages, list):
         state["limitations"].append({
-            "check": "http_retrieval",
-            "reason": "Crawl permission could not be established, so retrieval was not attempted.",
-            "affected_checks": ["server_html_extractability", "render_diff"],
+            "check": "evidence_input",
+            "reason": (
+                "Shared evidence does not contain a valid pages list."
+            ),
+            "affected_checks": ["all"],
         })
+        state["status"] = "failure"
         return finalize(state)
 
-    if permission == "disallowed":
+    if not pages:
         state["limitations"].append({
-            "check": "http_retrieval",
+            "check": "evidence_input",
             "reason": (
-                "The target path is disallowed by robots.txt; page retrieval was "
-                "deliberately not attempted."
+                "Shared evidence contains no pages. No website findings "
+                "were inferred from missing evidence."
             ),
-            "affected_checks": ["server_html_extractability", "render_diff"],
-        })
-        return finalize(state)
-
-    if permission == "unknown":
-        state["limitations"].append({
-            "check": "http_retrieval",
-            "reason": (
-                "robots.txt could not be retrieved, so crawl permission is unverified "
-                "and retrieval was not attempted."
-            ),
-            "affected_checks": ["server_html_extractability", "render_diff"],
+            "affected_checks": ["all"],
         })
         state["status"] = "partial_failure"
         return finalize(state)
 
-    fetched = stage_fetch(target, user_agent, timeout, state)
-    if fetched is None:
-        return finalize(state)
-
-    analysis = stage_extractability(target, fetched.get("body") or "", state)
-    stage_render(target, analysis, timeout, allow_render, state)
+    stage_robots(evidence, state)
+    stage_retrieval(evidence, state)
+    stage_extractability(evidence, state)
+    stage_render(evidence, state, allow_render)
 
     return finalize(state)
 
 
-def finalize(state: dict) -> dict:
-    return {
-        "skill": SKILL_ID,
-        "status": state["status"],
-        "observations": state["observations"],
-        "findings": sorted(state["findings"], key=lambda f: f["local_id"]),
-        "limitations": state["limitations"],
-    }
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Audit crawl permission, retrieval, rendering and machine readability."
+        description=(
+            "Analyze shared crawl/render evidence without making "
+            "network requests."
+        )
     )
-    parser.add_argument("url", help="Target URL or bare domain.")
-    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--budget-ms", type=int, default=DEFAULT_BUDGET_MS)
-    parser.add_argument("--sample-file", default=None)
-    parser.add_argument("--no-render", action="store_true")
+
+    parser.add_argument(
+        "url",
+        help="Target URL or bare domain.",
+    )
+
+    parser.add_argument(
+        "--evidence-file",
+        default=None,
+        help=(
+            "Path to the shared evidence.json. "
+            "Canonical specialist input."
+        ),
+    )
+
+    parser.add_argument(
+        "--sample-file",
+        default=None,
+        help=(
+            "Deprecated compatibility option. Accepted so older "
+            "orchestrators do not fail argument parsing."
+        ),
+    )
+
+    parser.add_argument(
+        "--user-agent",
+        default=DEFAULT_USER_AGENT,
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    parser.add_argument(
+        "--budget-ms",
+        type=int,
+        default=DEFAULT_BUDGET_MS,
+    )
+
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
@@ -751,45 +683,82 @@ def main() -> int:
                 "reason": "No target URL supplied.",
                 "affected_checks": ["all"],
             }],
+            "proactive_recommendations": [],
         }, indent=2))
         return 2
 
     started = time.monotonic()
 
-    try:
-        result = run(
-            url=args.url.strip(),
-            user_agent=args.user_agent,
-            timeout=args.timeout,
-            allow_render=not args.no_render,
-        )
-    except Exception as exc:  # pragma: no cover - fault isolation boundary
+    evidence_path = args.evidence_file
+
+    # --evidence-file is canonical. --sample-file is intentionally not
+    # loaded because the new contract uses normalized evidence.json.
+    evidence, error = load_evidence(evidence_path)
+
+    if evidence is None:
         result = {
             "skill": SKILL_ID,
             "status": "failure",
             "observations": [],
             "findings": [],
             "limitations": [{
-                "check": "specialist_execution",
-                "reason": f"Unhandled error during audit: {type(exc).__name__}: {exc}",
+                "check": "evidence_input",
+                "reason": error or "Shared evidence is unavailable.",
                 "affected_checks": ["all"],
             }],
+            "proactive_recommendations": [],
         }
+    else:
+        try:
+            result = run(
+                evidence=evidence,
+                allow_render=not args.no_render,
+            )
+        except Exception as exc:
+            result = {
+                "skill": SKILL_ID,
+                "status": "failure",
+                "observations": [],
+                "findings": [],
+                "limitations": [{
+                    "check": "specialist_execution",
+                    "reason": (
+                        f"Unhandled error during evidence analysis: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "affected_checks": ["all"],
+                }],
+                "proactive_recommendations": [],
+            }
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    result["observations"].append(f"Specialist wall time: {elapsed_ms} ms.")
+
+    result["observations"].append(
+        f"Specialist wall time: {elapsed_ms} ms."
+    )
 
     if elapsed_ms > args.budget_ms:
         result["limitations"].append({
             "check": "time_budget",
-            "reason": f"Specialist exceeded its budget of {args.budget_ms} ms.",
+            "reason": (
+                f"Specialist exceeded its budget of "
+                f"{args.budget_ms} ms."
+            ),
             "affected_checks": [],
         })
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(
+        result,
+        indent=2,
+        ensure_ascii=False,
+    ))
 
-    return 0 if result["status"] in ("success", "partial_failure") else 1
+    return (
+        0
+        if result["status"] in {"success", "partial_failure"}
+        else 1
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

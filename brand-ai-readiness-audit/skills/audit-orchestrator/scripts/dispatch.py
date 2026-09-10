@@ -33,8 +33,7 @@ DEFAULT_SPECIALIST_TIMEOUT = 120
 DEFAULT_EVIDENCE_TIMEOUT = 90
 DEFAULT_SAMPLE_LIMIT = 12
 CHECK_SCRIPT = os.path.join("scripts", "check.py")
-EVIDENCE_SCRIPT = os.path.join("audit-orchestrator", "scripts", "evidence.py")
-
+EVIDENCE_SCRIPT = os.path.join("skills", "audit-orchestrator", "scripts", "evidence.py")
 
 def marketplace_root_default() -> str:
     """scripts/ -> audit-orchestrator/ -> skills/ -> marketplace root."""

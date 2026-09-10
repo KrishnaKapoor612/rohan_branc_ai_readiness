@@ -2,9 +2,9 @@
 """
 dispatch.py -- marketplace-level specialist runner for audit-orchestrator.
 
-Reads marketplace.json, builds the shared page sample, runs every non-entrypoint
-skill through the specialist contract, and emits one aggregate object for
-merge.py.
+Reads marketplace.json, collects shared evidence ONCE via evidence.py, runs
+every non-entrypoint skill through the specialist contract against that same
+evidence, and emits one aggregate object for merge.py.
 
 Knows nothing about what any specialist checks. Adding a skill to the manifest
 is sufficient to have it run; no code here changes.
@@ -12,7 +12,8 @@ is sufficient to have it run; no code here changes.
 This module does NOT:
     - perform website checks itself;
     - assign severities or finding IDs;
-    - abort the audit because one specialist failed.
+    - abort the audit because one specialist failed;
+    - let a specialist fetch its own copy of a sampled page.
 
 See references/specialist-contract.md for the interface enforced here.
 """
@@ -25,12 +26,14 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from typing import Optional
 
 DEFAULT_SPECIALIST_TIMEOUT = 120
+DEFAULT_EVIDENCE_TIMEOUT = 90
 DEFAULT_SAMPLE_LIMIT = 12
 CHECK_SCRIPT = os.path.join("scripts", "check.py")
-SAMPLER_SCRIPT = os.path.join("scripts", "sitemap.py")
+EVIDENCE_SCRIPT = os.path.join("audit-orchestrator", "scripts", "evidence.py")
 
 
 def marketplace_root_default() -> str:
@@ -64,91 +67,84 @@ def validate_manifest(manifest: dict) -> tuple[dict, list[dict]]:
     return entrypoints[0], specialists
 
 
-def find_sampler(specialists: list[dict]) -> Optional[dict]:
+def build_evidence(
+    root: str, url: str, work_dir: str, limit: int, timeout: int, no_render: bool,
+) -> tuple[Optional[str], dict, Optional[dict]]:
     """
-    The sample producer is declared in the manifest, not hardcoded:
+    Run evidence.py once. Returns (evidence_file_or_None, summary, limitation_or_None).
 
-        { "id": "crawl-render-audit", "path": "...", "provides": ["page_sample"] }
-
-    Falls back to the first specialist that ships a scripts/sitemap.py, so a
-    manifest written before `provides` existed still produces a shared sample.
+    A failure here does not abort the audit: specialists still run and record
+    their own limitations against a missing/empty evidence file, exactly as
+    they would against any other collection gap.
     """
-    for skill in specialists:
-        if "page_sample" in (skill.get("provides") or []):
-            return skill
-    return None
+    script = os.path.join(root, EVIDENCE_SCRIPT)
 
-
-def find_sampler_fallback(root: str, specialists: list[dict]) -> Optional[dict]:
-    """Manifest-free fallback: the first specialist that ships a sampler script."""
-    for skill in specialists:
-        candidate = os.path.join(root, skill.get("path", ""), SAMPLER_SCRIPT)
-        if os.path.isfile(candidate):
-            return skill
-    return None
-
-
-def build_sample(root: str, sampler: Optional[dict], url: str,
-                 limit: int, timeout: int) -> tuple[dict, Optional[dict]]:
-    """Run the sampler and return (sample, limitation_or_None)."""
-    fallback = {
-        "origin": url,
-        "strategy": "Target URL only: no page sampler available.",
-        "pages_inspected": 1,
-        "urls": [url],
-        "url_count_available": 0,
-        "truncated": False,
-        "limitations": [],
-    }
-
-    if sampler is None:
-        return fallback, {
-            "skill": "dispatch",
-            "check": "page_sample",
-            "reason": "No skill in the manifest declares provides: page_sample.",
-            "affected_checks": ["scope_claims"],
-        }
-
-    script = os.path.join(root, sampler["path"], SAMPLER_SCRIPT)
     if not os.path.isfile(script):
-        return fallback, {
-            "skill": sampler["id"],
-            "check": "page_sample",
-            "reason": f"Sampler script not found at {script}.",
-            "affected_checks": ["scope_claims"],
+        return None, {}, {
+            "skill": "dispatch",
+            "check": "evidence_collection",
+            "reason": f"evidence.py not found at {script}.",
+            "affected_checks": ["all"],
         }
+
+    command = [
+        sys.executable, script, url,
+        "--limit", str(limit),
+        "--timeout", str(min(timeout, 30)),
+        "--work-dir", work_dir,
+    ]
+    if no_render:
+        command.append("--no-render")
 
     try:
         completed = subprocess.run(
-            [sys.executable, script, url, "--limit", str(limit), "--emit-sample"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+            command, capture_output=True, text=True, timeout=timeout, check=False,
         )
-        sample = json.loads(completed.stdout)
-        return sample, None
     except subprocess.TimeoutExpired:
-        return fallback, {
-            "skill": sampler["id"],
-            "check": "page_sample",
-            "reason": f"Sampler exceeded {timeout}s; the audit fell back to the target URL only.",
-            "affected_checks": ["scope_claims"],
+        return None, {}, {
+            "skill": "dispatch",
+            "check": "evidence_collection",
+            "reason": f"Evidence collection exceeded {timeout}s and was terminated. "
+                      "Specialists ran without shared evidence.",
+            "affected_checks": ["all"],
         }
     except Exception as exc:
-        return fallback, {
-            "skill": sampler["id"],
-            "check": "page_sample",
-            "reason": f"Sampler failed: {type(exc).__name__}: {exc}",
-            "affected_checks": ["scope_claims"],
+        return None, {}, {
+            "skill": "dispatch",
+            "check": "evidence_collection",
+            "reason": f"Evidence collection failed: {type(exc).__name__}: {exc}",
+            "affected_checks": ["all"],
         }
 
+    try:
+        summary = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None, {}, {
+            "skill": "dispatch",
+            "check": "evidence_collection",
+            "reason": "evidence.py did not produce parseable stdout. "
+                      f"stderr: {(completed.stderr or '').strip()[:400]}",
+            "affected_checks": ["all"],
+        }
 
-def run_specialist(root: str, skill: dict, url: str, sample_file: Optional[str],
+    evidence_file = summary.get("evidence_file")
+    if not evidence_file or not os.path.isfile(evidence_file):
+        return None, summary, {
+            "skill": "dispatch",
+            "check": "evidence_collection",
+            "reason": "evidence.py reported no usable evidence_file.",
+            "affected_checks": ["all"],
+        }
+
+    return evidence_file, summary, None
+
+
+def run_specialist(root: str, skill: dict, url: str, evidence_file: Optional[str],
                    timeout: int, no_render: bool) -> dict:
     """
-    Execute one specialist. Any failure becomes a well-formed failure result,
-    never an exception that ends the audit.
+    Execute one specialist against the shared evidence file. Any failure
+    becomes a well-formed failure result, never an exception that ends the
+    audit.
     """
     skill_id = skill.get("id", "unknown")
     script = os.path.join(root, skill.get("path", ""), CHECK_SCRIPT)
@@ -171,8 +167,8 @@ def run_specialist(root: str, skill: dict, url: str, sample_file: Optional[str],
         return failure(f"No check.py found at {script}.", "specialist_discovery")
 
     command = [sys.executable, script, url]
-    if sample_file:
-        command += ["--sample-file", sample_file]
+    if evidence_file:
+        command += ["--evidence-file", evidence_file]
     if no_render:
         command.append("--no-render")
 
@@ -229,11 +225,13 @@ def run_specialist(root: str, skill: dict, url: str, sample_file: Optional[str],
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run every specialist skill declared in marketplace.json."
+        description="Run every specialist skill declared in marketplace.json "
+                    "against one shared evidence collection."
     )
     parser.add_argument("url")
     parser.add_argument("--marketplace-root", default=None)
     parser.add_argument("--timeout", type=int, default=DEFAULT_SPECIALIST_TIMEOUT)
+    parser.add_argument("--evidence-timeout", type=int, default=DEFAULT_EVIDENCE_TIMEOUT)
     parser.add_argument("--sample-limit", type=int, default=DEFAULT_SAMPLE_LIMIT)
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--no-render", action="store_true")
@@ -263,33 +261,42 @@ def main() -> int:
 
     limitations: list[dict] = []
 
-    sampler = find_sampler(specialists) or find_sampler_fallback(root, specialists)
-    sample, sample_limitation = build_sample(
-        root, sampler, args.url, args.sample_limit, args.timeout
-    )
-    if sample_limitation:
-        limitations.append(sample_limitation)
-    for entry in sample.get("limitations", []):
-        limitations.append({
-            "skill": (sampler or {}).get("id", "dispatch"),
-            "check": entry.get("check", "page_sample"),
-            "reason": entry.get("reason", ""),
-            "affected_checks": entry.get("affected_checks", []),
-        })
-
+    # Every audit gets its own working directory so concurrent audits never
+    # collide and so evidence.json is never committed to the repository.
     work_dir = args.work_dir or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "brand-ai-readiness-audit"
+        os.environ.get("TMPDIR", "/tmp"), f"brand-ai-audit-{uuid.uuid4().hex[:12]}"
     )
     os.makedirs(work_dir, exist_ok=True)
-    sample_file = os.path.join(work_dir, "sample.json")
 
-    with open(sample_file, "w", encoding="utf-8") as handle:
-        json.dump(sample, handle, indent=2)
+    evidence_file, evidence_summary, evidence_limitation = build_evidence(
+        root, args.url, work_dir, args.sample_limit, args.evidence_timeout, args.no_render,
+    )
+    if evidence_limitation:
+        limitations.append(evidence_limitation)
+
+    # `sample` is kept in the aggregate/report for backward compatibility with
+    # merge.py and schema.json, which read audit.sample. It is now sourced
+    # from evidence.py's own collection rather than a separate sampler run.
+    sample = {
+        "strategy": "See site_level.sitemap.strategy in the shared evidence file.",
+        "pages_inspected": evidence_summary.get("pages_sampled", 0),
+        "urls": [],
+    }
+    if evidence_file:
+        try:
+            with open(evidence_file, "r", encoding="utf-8") as handle:
+                evidence_doc = json.load(handle)
+            sample["urls"] = [p.get("url") for p in evidence_doc.get("pages", [])]
+            sample["strategy"] = evidence_doc.get("site_level", {}).get(
+                "sitemap", {}
+            ).get("strategy", sample["strategy"])
+        except Exception:
+            pass
 
     results = []
     for skill in specialists:
         results.append(
-            run_specialist(root, skill, args.url, sample_file,
+            run_specialist(root, skill, args.url, evidence_file,
                            args.timeout, args.no_render)
         )
 
@@ -314,8 +321,8 @@ def main() -> int:
         "marketplace": manifest.get("name"),
         "marketplace_version": manifest.get("version"),
         "marketplace_root": root,
+        "evidence_file": evidence_file,
         "sample": sample,
-        "sample_file": sample_file,
         "results": results,
         "limitations": limitations,
         "proactive_recommendations": proactive,

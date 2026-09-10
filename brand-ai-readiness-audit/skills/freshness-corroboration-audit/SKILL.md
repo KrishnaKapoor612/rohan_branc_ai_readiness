@@ -1,6 +1,6 @@
 ---
 name: freshness-corroboration-audit
-description: Audits whether an assistant can tell which real-world entity a site belongs to, how old its claims are, and whether anything outside the site agrees with them. Detects missing Organization or equivalent identity markup, an identity with no sameAs links to external records, a site that states more than one name for itself, content with no date signal so a current fact cannot outrank a stale one, and declared sameAs profiles that do not resolve. Use when diagnosing why an assistant repeats outdated facts about a brand, confuses it with a different entity of the same name, or describes it in someone else's words.
+description: Audits whether a website provides clear identity signals, usable freshness signals for time-sensitive claims, and corroboration-ready information that can help AI systems distinguish the brand from similarly named entities and avoid relying on outdated information.
 license: Apache-2.0
 allowed-tools: Bash
 compatibility: Requires a skills-compatible agent runtime able to execute the bundled Python 3.9+ scripts. Standard library only, no third-party packages, no browser.
@@ -10,112 +10,236 @@ compatibility: Requires a skills-compatible agent runtime able to execute the bu
 
 ## When to use
 
-Use this skill for the trust layer of discoverability. A page can be perfectly
-reachable, rendered and extractable and still lose, because a machine cannot
-tell which entity it describes, cannot tell when the claim was true, and finds
-the claim contradicted or unsupported elsewhere.
+Use this skill for the trust layer of AI discoverability. A page can be reachable
+and readable yet still provide weak signals for entity identification, freshness,
+or cross-source consistency.
 
-Invoked by the marketplace entrypoint, `audit-orchestrator`. Can also run
-standalone.
+Invoked by the marketplace entrypoint, `audit-orchestrator`.
 
-## The three failures it separates
+## Responsibility
 
-| Stage | Question | Failure |
+This skill evaluates three related dimensions:
+
+| Dimension | Question | What counts as a meaningful problem |
 |---|---|---|
-| `unambiguous` | which real-world thing is this? | name collides with another entity; nothing distinguishes them |
-| `current` | when was this true? | the claim carries no date, so recency cannot favour it |
-| `corroborated` | does anything else say the same? | the claim exists in one place only, or its external references are dead |
+| `identity` | Which real-world entity does this site represent? | Identity signals are materially conflicting or insufficient to distinguish the site from a plausible same-name entity. |
+| `freshness` | When was a time-sensitive claim true? | A materially time-sensitive factual claim lacks a usable freshness signal or has conflicting temporal signals that make the current version difficult to identify. |
+| `corroboration readiness` | Can the site's identity and important facts be cross-checked? | Declared external identity references are broken, or the site's own identity signals make external corroboration unnecessarily ambiguous. |
 
-The freshness failure is the least intuitive and the most damaging. Updating a
-page does not delete the older version of the fact from the rest of the web, and
-the old version usually has more copies. When the current statement is undated
-and the stale one is dated, recency cannot be used to prefer the current one, so
-the outdated version keeps being repeated.
+These dimensions are related but independent. A weakness in one dimension must not be
+inferred merely because another dimension is weak.
 
-## Inputs
+## Evidence model
 
-Required:
+The orchestrator supplies the shared page sample and page-level evidence collected for
+the audit. This skill is an **analysis specialist**, not a page retriever.
 
-- `url` — public website URL or bare domain.
+The shared evidence may contain, where available:
 
-Optional:
+- sampled URLs and their final URLs;
+- HTTP status and content type;
+- retrieved HTML/text;
+- JSON-LD blocks and parsed structured-data signals;
+- Open Graph metadata;
+- visible date elements and metadata;
+- declared `sameAs` values;
+- retrieval/rendering limitations relevant to interpreting those signals.
 
-- `--sample-file` — the shared page sample. Bounds every scope claim.
-- `--no-external` — skip verification of declared `sameAs` targets.
-- `--user-agent`, `--timeout`, `--budget-ms`.
+The skill must analyze the supplied evidence and must not independently re-fetch sampled
+pages. This keeps all specialists on the same page set and prevents duplicate network
+work.
 
-## Execution
+If the shared evidence is unavailable or incomplete, record a limitation and restrict
+claims to the evidence that is actually available. Never turn missing evidence into a
+website defect.
 
-`scripts/check.py <url> [--sample-file PATH] [--no-external]`
+## Identity analysis
 
-## Procedure
+Inspect machine-readable and page-level identity signals, including relevant JSON-LD
+identity nodes and `og:site_name` when present.
 
-1. Load the shared page sample; record a limitation if none was supplied.
-2. Retrieve each sampled page once, polite delay between requests.
-3. Flatten every JSON-LD block on the page, expanding `@graph`, skipping blocks
-   that fail to parse.
-4. Identify nodes typed `Organization`, `Corporation`, `LocalBusiness`,
-   `OnlineStore`, `Store`, `Brand`, `WebSite`, `NGO` or
-   `EducationalOrganization`.
-5. Collect the declared `name` values, the `sameAs` array, and `og:site_name`.
-6. Look for any date signal: `dateModified`, `datePublished`, `dateCreated`,
-   `uploadDate`, a `time[datetime]` element, or article modified-time metadata.
-7. Emit findings against the thresholds below.
-8. Unless disabled, fetch up to 3 declared `sameAs` targets and check only that
-   they resolve. Report at medium confidence, because one environment being
-   blocked is not proof the profile is gone.
-9. Emit proactive recommendations.
+Recognized identity types may include `Organization`, `Corporation`, `LocalBusiness`,
+`OnlineStore`, `Store`, `Brand`, `WebSite`, `NGO`, and `EducationalOrganization`.
+
+The presence or absence of one particular schema type is **not** itself a defect.
+Identity analysis should consider the available signals together.
+
+A site may legitimately use abbreviated names, legal names, trading names, or brand
+names. Different strings are not automatically conflicting.
+
+### Identity finding rule
+
+Emit an identity finding only when the evidence demonstrates a **materially inconsistent
+or ambiguous identity**, for example:
+
+- authoritative identity signals on the site name different organizations or brands;
+- the site's own identity signals materially disagree across important sampled pages;
+- the available identity information is insufficient to distinguish the site from a
+  plausible same-name entity and the site provides no useful disambiguating signal.
+
+If no identity-typed JSON-LD is present but the site's visible and metadata identity is
+otherwise clear, record an observation or proactive recommendation rather than a defect.
+
+## Freshness analysis
+
+Date signals are useful only when they help establish the currency of a claim.
+Inspect signals such as:
+
+- `dateModified`;
+- `datePublished`;
+- `dateCreated`;
+- `uploadDate`;
+- `time[datetime]`;
+- article modified-time metadata;
+- other explicit page-level temporal statements present in the supplied evidence.
+
+Do **not** treat an undated page as stale merely because it has no date signal.
+Homepages, contact pages, legal pages, evergreen descriptions, and other content may
+legitimately have no date.
+
+First determine whether the page contains a materially time-sensitive factual claim.
+Examples can include current leadership, pricing, availability, current offerings,
+current policies, locations, deadlines, or other facts whose correctness depends on
+time. Then evaluate whether the evidence contains a usable freshness signal for that
+claim.
+
+### Freshness finding rule
+
+Emit a freshness finding only when:
+
+1. the supplied evidence identifies a materially time-sensitive factual claim; and
+2. the claim has no usable freshness signal, or the available temporal signals are
+   materially inconsistent; and
+3. the limitation is not simply caused by unavailable retrieval/rendering evidence.
+
+Absence of a date on an otherwise evergreen page is not a finding.
+
+## Corroboration-readiness analysis
+
+This skill does not perform unrestricted web search and does not claim that external
+sources agree or disagree with the site unless such evidence is explicitly supplied by
+the marketplace.
+
+Inspect the site's own declared identity links, especially `sameAs`, when present.
+Declared external references can strengthen identity disambiguation and provide useful
+starting points for cross-source verification.
+
+The absence of `sameAs` is **not** by itself a defect. It should normally produce an
+observation or proactive recommendation when useful.
+
+If the site declares an external identity reference and the shared evidence includes a
+bounded verification result showing that the target returned HTTP 404 or 410, that is a
+valid finding. Other network failures are not proof that the external profile is gone.
+
+When external verification is enabled by the marketplace, at most three public `sameAs`
+targets may be checked. Those checks are limited to determining whether the declared
+reference resolves; they do not establish that the external source agrees with the
+site's claims.
 
 ## Detection thresholds
 
 | Finding | Fires when |
 |---|---|
-| `FC-001` no declared identity | no sampled page carries an identity-typed JSON-LD node |
-| `FC-002` no sameAs graph | an identity node exists but no `sameAs` value anywhere in the sample |
-| `FC-003` conflicting self-names | more than one distinct name across identity `name` and `og:site_name` |
-| `FC-004` undated content | a sampled page exposes no date signal at all |
-| `FC-005` dead sameAs target | a checked `sameAs` URL returns 404 or 410 |
+| `FC-001` conflicting identity signals | Supplied evidence shows materially conflicting identity signals that could cause entity confusion. |
+| `FC-002` time-sensitive claim lacks usable freshness | A materially time-sensitive factual claim lacks a usable freshness signal, or its available temporal signals materially conflict. |
+| `FC-003` dead declared identity reference | A checked public `sameAs` target returns HTTP 404 or 410. |
 
-`FC-001` and `FC-002` are mutually exclusive by construction: a site cannot lack
-an identity node and also have one without `sameAs`. This keeps one root cause
-from producing two findings.
+Do not emit a finding solely because:
+
+- Organization JSON-LD is absent;
+- `sameAs` is absent;
+- a page has no date;
+- a page lacks a particular metadata field;
+- two equivalent brand/legal-name forms differ textually;
+- a third-party source was not searched;
+- evidence could not be retrieved or rendered.
+
+These conditions may instead become observations, limitations, or proactive
+recommendations when they are useful to the audit.
+
+## Procedure
+
+1. Load the shared page/evidence sample supplied by the orchestrator.
+2. Verify that the evidence is bounded to the shared sample; do not select additional
+   pages independently.
+3. For each usable sampled page, inspect the supplied identity, temporal, and
+   `sameAs` evidence.
+4. Evaluate identity signals together rather than treating any single missing field as
+   a failure.
+5. Identify materially time-sensitive claims before evaluating freshness.
+6. Evaluate whether those claims have usable and internally consistent freshness
+   signals.
+7. Evaluate declared `sameAs` references using supplied verification evidence, when
+   available. Do not perform unrestricted external discovery.
+8. Emit only evidence-backed findings. Put non-defect observations in `observations`
+   and incomplete checks in `limitations`.
+9. Emit proactive recommendations only when they would materially strengthen identity,
+   freshness, or corroboration readiness.
+10. Sort findings and other deterministic arrays according to the specialist contract.
 
 ## What this skill deliberately does not claim
 
-It does not query the open web for third-party descriptions of the brand, and it
-does not assert that any external source contradicts the site. Doing so would
-require a search backend, which would make the marketplace dependent on an
-external service and non-reproducible. That gap is stated explicitly as a
-limitation in every report, so a reader never mistakes silence for agreement.
+It does not claim that a site is invisible to AI assistants merely because a particular
+markup element is missing.
 
-What it can establish without a search backend is whether the site has made
-corroboration **possible**: a declared identity, resolvable external references,
-one consistent name, and dated claims. Those are the preconditions. The
-proactive recommendations cover the rest.
+It does not claim that undated content is stale.
+
+It does not claim that the absence of `sameAs` means identity ambiguity.
+
+It does not query the open web for arbitrary third-party descriptions, and it does not
+assert that an external source contradicts the site without explicit supporting
+evidence. This keeps the marketplace portable and avoids turning this specialist into
+an unrestricted search agent.
+
+Without external-source evidence, this skill can establish **corroboration readiness**:
+clear identity signals, usable freshness signals for time-sensitive claims, and bounded
+validation of declared external identity references. It cannot establish broad
+third-party agreement.
 
 ## Evidence rules
 
-Ratios over sampled pages, named example URLs, measured values rather than
-inferences. External checks are reported at medium confidence and always paired
-with a limitation naming what was not assessed.
+- Use measured values and named example URLs where available.
+- Bound ratios and counts to the supplied sample.
+- Distinguish observed evidence from interpretation.
+- Do not use absence of evidence as evidence of absence.
+- Every finding must include evidence sufficient for another reviewer to understand why
+  the condition was detected.
+- External reference checks are medium confidence unless the supplied evidence provides
+  stronger, direct confirmation.
 
 ## Scope boundaries
 
-Owns entity identity, freshness signals and corroboration readiness.
+Owns:
 
-Does not own crawl permission, retrieval, rendering or extraction structure
-(`crawl-render-audit`), nor post-arrival orientation (`engagement-audit`).
-Missing JSON-LD *as a structured-data defect* belongs to `crawl-render-audit`;
-this skill only asks whether an **identity** is declared, which is a different
-question about the same markup.
+- entity identity interpretation;
+- identity disambiguation signals;
+- freshness signals for materially time-sensitive claims;
+- declared external identity-reference validation;
+- corroboration readiness.
+
+Does not own:
+
+- crawl permission or `robots.txt` decisions;
+- URL discovery or page sampling;
+- page retrieval/network collection;
+- browser rendering;
+- extraction/readability infrastructure;
+- structured-data implementation as a general defect;
+- post-arrival orientation or on-site engagement.
+
+A missing or malformed JSON-LD implementation may be relevant evidence here, but a
+structured-data defect itself belongs to `crawl-render-audit`. This skill evaluates what
+the available identity/freshness evidence means for discoverability.
 
 ## Safety and operational guardrails
 
-- Read-only, GET only, TLS verified, bounded bytes and redirects.
-- Off-origin requests are limited to at most 3 public `sameAs` URLs the site
-  itself declares, which is the corroboration exception in the specialist
-  contract. Nothing else off-origin is fetched.
-- Never authenticates, never bypasses an access control.
+- Read-only analysis.
+- Do not authenticate, submit forms, mutate state, bypass access controls, or disable
+  TLS verification.
+- Do not independently crawl or fetch arbitrary pages.
+- External requests, if any, are limited to at most three public `sameAs` targets that
+  the site itself declares and are subject to the marketplace specialist contract.
+- Respect the orchestrator's bounded runtime and evidence scope.
 - No third-party packages.
 
 ## Output

@@ -1,6 +1,6 @@
 ---
 name: engagement-audit
-description: Audits what happens after a visitor arrives from an AI assistant's answer, when they already know what they want and the site does not. Detects loss of the arriving context: no deep-linkable anchor for the answer, consent interstitials that block content, pages with no h1 or main landmark to orient against, no on-site search recovery path, navigation that exists only after client-side execution, and missing breadcrumbs on deep pages. Use when diagnosing why visitors who do reach a site bounce within seconds, or why an assistant can only link a site's home page instead of the section that answers the question.
+description: Audits what happens after a visitor arrives from an AI assistant's answer, when they already know what they want and the site does not. Detects loss of the arriving context:no deep-linkable anchor for the answer, consent interstitials that block content, pages with no h1 or main landmark to orient against, no on-site search recovery path, navigation that exists only after client-side execution, and missing breadcrumbs on deep pages. Use when diagnosing why visitors who do reach a site bounce within seconds, or why an assistant can only link a site's home page instead of the section that answers the question.
 license: Apache-2.0
 allowed-tools: Bash
 compatibility: Requires a skills-compatible agent runtime able to execute the bundled Python 3.9+ scripts. Standard library only, no third-party packages, no browser.

@@ -2,41 +2,27 @@
 """
 check.py -- specialist coordinator for the freshness-corroboration-audit skill.
 
-Owns the trust half of discoverability. A page can be perfectly reachable,
-rendered and extractable and still lose, because the assistant cannot tell which
-entity it describes, cannot tell how old the claim is, and finds the same claim
-contradicted elsewhere on the open web.
+Owns the trust half of discoverability: identity, declared sameAs links and
+freshness signals. Page collection is owned by audit-orchestrator/evidence.py.
 
-Three distinct failure modes, all downstream of extraction:
-
-    unambiguous  - is it clear which real-world entity this is?
-    corroborated - does anything outside this site agree?
-    current      - is there any signal about when this was true?
-
-This skill does NOT own crawl permission, rendering, extraction structure
-(crawl-render-audit) or post-arrival orientation (engagement-audit).
-
-Read-only and bounded. The only requests outside the target origin are HEAD-like
-GETs of the sameAs profile URLs the site itself declares, capped at
-MAX_SAMEAS_CHECKS, which is the corroboration check the contract's section 8
-explicitly permits.
+This specialist does not import fetch.py or robots.py. The only network request
+remaining here is the explicitly permitted, bounded verification of declared
+sameAs URLs.
 """
-
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
-import os
 import re
+import ssl
 import sys
 import time
-from html.parser import HTMLParser
-from typing import Any, Optional
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 SKILL_ID = "freshness-corroboration-audit"
-
 DEFAULT_USER_AGENT = (
     "BrandAIReadinessAuditBot/1.0 "
     "(+https://github.com/KrishnaKapoor612/brand-ai-readiness-audit)"
@@ -45,170 +31,122 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_BUDGET_MS = 90_000
 POLITE_DELAY_SECONDS = 0.4
 MAX_SAMEAS_CHECKS = 3
+MAX_SAMEAS_BYTES = 200 * 1024
+MAX_REDIRECTS = 3
 
 IDENTITY_TYPES = {
     "organization", "corporation", "localbusiness", "onlinestore",
     "store", "brand", "website", "ngo", "educationalorganization",
 }
-
 DATE_FIELDS = ("dateModified", "datePublished", "dateCreated", "uploadDate")
 
+# Kept for compatibility with the old helper surface; evidence.py now owns
+# extraction of these signals.
 DATE_MARKUP = re.compile(
     r'(<time\b[^>]*datetime\s*=|itemprop\s*=\s*["\']date(Modified|Published)["\']'
     r'|property\s*=\s*["\']article:(modified|published)_time["\'])',
     re.I,
 )
-
 OG_SITE_NAME = re.compile(
     r'<meta[^>]+property\s*=\s*["\']og:site_name["\'][^>]+content\s*=\s*["\'](.*?)["\']',
     re.I | re.S,
 )
 
 
-# ---------------------------------------------------------------------------
-# Infrastructure
-# ---------------------------------------------------------------------------
-
-def load_sibling(module_name: str) -> tuple[Optional[Any], Optional[str]]:
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, f"{module_name}.py")
-    if not os.path.isfile(path):
-        return None, f"{module_name}.py is not present at {path}."
-    try:
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            return None, f"{module_name}.py could not be loaded as a module."
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(module_name, None)
-            raise
-        return module, None
-    except Exception as exc:
-        return None, f"{module_name}.py failed to import: {type(exc).__name__}: {exc}"
-
-
-def load_sample(path: Optional[str], fallback_url: str) -> tuple[list[str], Optional[str]]:
+def load_evidence(path: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
     if not path:
-        return [fallback_url], (
-            "No shared page sample was supplied; only the target URL was audited, "
-            "so site-wide scope could not be established."
-        )
+        return None, "No --evidence-file was supplied."
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            sample = json.load(handle)
-        urls = [u for u in (sample.get("urls") or []) if isinstance(u, str)]
-        if not urls:
-            return [fallback_url], (
-                f"Shared page sample at {path} contained no URLs."
-            )
-        return urls, None
+            evidence = json.load(handle)
     except Exception as exc:
-        return [fallback_url], (
-            f"Shared page sample at {path} could not be read "
-            f"({type(exc).__name__}: {exc})."
-        )
+        return None, f"Evidence file at {path} could not be read ({type(exc).__name__}: {exc})."
+    if not isinstance(evidence, dict):
+        return None, f"Evidence file at {path} did not contain a JSON object."
+    if not isinstance(evidence.get("pages"), list):
+        return None, "Shared evidence is missing the pages array."
+    return evidence, None
 
 
-class _TextExtractor(HTMLParser):
-    SKIP = {"script", "style", "noscript", "template", "svg"}
+def analyze_identity(url: str, page: dict) -> dict:
+    """
+    Preserve the old analysis outputs while consuming normalized evidence.
 
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.chunks: list[str] = []
-        self._depth = 0
+    evidence.py already flattened the useful JSON-LD facts into per-block
+    types/names/same_as/dates, and separately exposes identity/date/OG signals.
+    No HTML re-parsing is needed here.
+    """
+    jsonld = page.get("jsonld") or []
+    if not isinstance(jsonld, list):
+        jsonld = []
 
-    def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP:
-            self._depth += 1
+    identity_blocks = []
+    jsonld_nodes = 0
+    names = set()
+    same_as = set()
 
-    def handle_endtag(self, tag):
-        if tag in self.SKIP and self._depth > 0:
-            self._depth -= 1
-
-    def handle_data(self, data):
-        if self._depth == 0 and data.strip():
-            self.chunks.append(data.strip())
-
-    def text(self) -> str:
-        return " ".join(self.chunks)
-
-
-def visible_text(html: str) -> str:
-    parser = _TextExtractor()
-    try:
-        parser.feed(html)
-    except Exception:
-        return re.sub(r"<[^>]+>", " ", html)
-    return parser.text()
-
-
-def flatten_jsonld(html: str) -> list[dict]:
-    """Every JSON-LD node on the page, graphs expanded, parse failures skipped."""
-    nodes: list[dict] = []
-    blocks = re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.I | re.S,
-    )
-    for block in blocks:
-        try:
-            parsed = json.loads(block.strip())
-        except Exception:
+    for block in jsonld:
+        if not isinstance(block, dict):
             continue
-        stack = parsed if isinstance(parsed, list) else [parsed]
-        while stack:
-            node = stack.pop(0)
-            if not isinstance(node, dict):
-                continue
-            nodes.append(node)
-            graph = node.get("@graph")
-            if isinstance(graph, list):
-                stack.extend(graph)
-    return nodes
+        types = {
+            str(t).strip().lower()
+            for t in (block.get("types") or [])
+            if isinstance(t, str) and t.strip()
+        }
+        # evidence.py records each JSON-LD block after flattening @graph for
+        # its type/name/sameAs fields. Count the block as an identity-bearing
+        # node when any recorded type is an identity type.
+        jsonld_nodes += 1
+        if types & IDENTITY_TYPES:
+            identity_blocks.append(block)
+        for name in block.get("names") or []:
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        for value in block.get("same_as") or []:
+            if isinstance(value, str) and value.strip():
+                same_as.add(value.strip())
 
+    identity_signals = page.get("identity_signals") or []
+    for signal in identity_signals:
+        if not isinstance(signal, dict):
+            continue
+        if signal.get("source") == "jsonld_name":
+            value = signal.get("value")
+            if isinstance(value, str) and value.strip():
+                names.add(value.strip())
 
-def node_types(node: dict) -> list[str]:
-    value = node.get("@type")
-    if isinstance(value, str):
-        return [value.lower()]
-    if isinstance(value, list):
-        return [v.lower() for v in value if isinstance(v, str)]
-    return []
+    open_graph = page.get("open_graph") or {}
+    og_site_name = open_graph.get("og:site_name")
+    if not isinstance(og_site_name, str) or not og_site_name.strip():
+        og_site_name = None
 
+    # Keep the shared normalized same_as list authoritative if present.
+    page_same_as = page.get("same_as")
+    if isinstance(page_same_as, list):
+        same_as = {
+            value.strip()
+            for value in page_same_as
+            if isinstance(value, str) and value.strip()
+        }
 
-def analyze_identity(url: str, html: str) -> dict:
-    nodes = flatten_jsonld(html)
-    identity = [n for n in nodes if set(node_types(n)) & IDENTITY_TYPES]
+    date_signals = page.get("date_signals")
+    if not isinstance(date_signals, list):
+        date_signals = []
 
-    names: list[str] = []
-    same_as: list[str] = []
-    for node in identity:
-        name = node.get("name")
-        if isinstance(name, str) and name.strip():
-            names.append(name.strip())
-        raw = node.get("sameAs")
-        if isinstance(raw, str):
-            same_as.append(raw)
-        elif isinstance(raw, list):
-            same_as.extend(v for v in raw if isinstance(v, str))
-
-    og = OG_SITE_NAME.search(html)
-
-    dated = any(
-        any(field in node for field in DATE_FIELDS) for node in nodes
-    ) or bool(DATE_MARKUP.search(html))
+    page_structure = page.get("page_structure") or {}
+    text_chars = page_structure.get("text_chars")
+    if not isinstance(text_chars, (int, float)):
+        text_chars = 0
 
     return {
         "url": url,
-        "jsonld_nodes": len(nodes),
-        "identity_nodes": len(identity),
-        "identity_names": sorted(set(names)),
-        "same_as": sorted(set(same_as)),
-        "og_site_name": og.group(1).strip() if og else None,
-        "has_date_signal": dated,
-        "text_chars": len(visible_text(html)),
+        "jsonld_nodes": jsonld_nodes,
+        "identity_nodes": len(identity_blocks),
+        "identity_names": sorted(names),
+        "same_as": sorted(same_as),
+        "og_site_name": og_site_name,
+        "has_date_signal": bool(date_signals),
+        "text_chars": int(text_chars),
     }
 
 
@@ -226,13 +164,6 @@ def scope_from_ratio(affected: int, total: int) -> tuple[str, int]:
 
 
 def site_scope(total: int) -> tuple[str, int]:
-    """
-    Scope for a claim about the whole origin, bounded by how much was sampled.
-
-    severity-model.md section 4 forbids inferring site_wide from one page. A
-    site-level claim backed by a single page is a single-page claim, and its
-    blast_radius must say so.
-    """
     if total >= 3:
         return "site_wide", 3
     if total == 2:
@@ -267,10 +198,6 @@ def finding(local_id, title, category, stage, evidence, stage_block,
     }
 
 
-# ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
-
 def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
     """Returns the sameAs URLs worth verifying, if any."""
     pages = sorted(analyses)
@@ -295,10 +222,8 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
                 f"Total JSON-LD nodes seen across the sample: "
                 f"{sum(analyses[u]['jsonld_nodes'] for u in pages)}.",
             ],
-            stage_block=2,
-            fact_criticality=3,
-            scope=site_wide_scope,
-            blast_radius=site_wide_radius,
+            stage_block=2, fact_criticality=3,
+            scope=site_wide_scope, blast_radius=site_wide_radius,
             affected_urls=pages[:12],
             action_summary=(
                 "Publish one Organization JSON-LD node on the home page carrying the "
@@ -328,10 +253,8 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
                 f"Declared name(s): "
                 f"{', '.join(sorted({n for u in pages for n in analyses[u]['identity_names']})) or 'none'}.",
             ],
-            stage_block=2,
-            fact_criticality=3,
-            scope=site_wide_scope,
-            blast_radius=site_wide_radius,
+            stage_block=2, fact_criticality=3,
+            scope=site_wide_scope, blast_radius=site_wide_radius,
             affected_urls=identity_pages[:12],
             action_summary=(
                 "Add a sameAs array to the Organization node listing the brand's "
@@ -352,7 +275,6 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
     declared = {n for u in pages for n in analyses[u]["identity_names"]}
     og_names = {analyses[u]["og_site_name"] for u in pages if analyses[u]["og_site_name"]}
     combined = {n.strip().lower() for n in (declared | og_names) if n}
-
     if len(combined) > 1:
         state["findings"].append(finding(
             local_id="FC-003",
@@ -364,16 +286,13 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
                 f"{', '.join(sorted(declared | og_names))}.",
                 "Sources compared: JSON-LD identity node name and og:site_name.",
             ],
-            stage_block=2,
-            fact_criticality=3,
-            scope=site_wide_scope,
-            blast_radius=site_wide_radius,
+            stage_block=2, fact_criticality=3,
+            scope=site_wide_scope, blast_radius=site_wide_radius,
             affected_urls=pages[:12],
             action_summary=(
                 "Choose one canonical name string and use it identically in the "
                 "Organization node, og:site_name and the title suffix. Express any "
-                "trading names through alternateName rather than by varying the "
-                "primary name."
+                "trading names through alternateName rather than by varying the primary name."
             ),
             action_rationale=(
                 "Agreement is what makes a fact repeatable. When a site disagrees with "
@@ -398,10 +317,8 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
                 "datePublished, time element or article modified-time metadata.",
                 "Example: " + undated[0],
             ],
-            stage_block=2,
-            fact_criticality=2,
-            scope=scope,
-            blast_radius=radius,
+            stage_block=2, fact_criticality=2,
+            scope=scope, blast_radius=radius,
             affected_urls=undated[:12],
             action_summary=(
                 "Emit dateModified on every page that carries a factual claim, and "
@@ -421,7 +338,50 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
     return all_same_as[:MAX_SAMEAS_CHECKS]
 
 
-def verify_same_as(targets, fetch, brand_names, timeout, state) -> None:
+class _BoundedRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, max_redirects: int) -> None:
+        super().__init__()
+        self.max_redirects = max_redirects
+        self.redirects = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self.redirects >= self.max_redirects:
+            raise URLError("maximum redirect limit reached")
+        self.redirects += 1
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def bounded_get(url: str, user_agent: str, timeout: float) -> dict:
+    """Bounded public GET used only for the explicit sameAs corroboration exception."""
+    handler = _BoundedRedirectHandler(MAX_REDIRECTS)
+    context = ssl.create_default_context()
+    from urllib.request import HTTPSHandler
+    opener = build_opener(handler, HTTPSHandler(context=context))
+    request = Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+        },
+        method="GET",
+    )
+    try:
+        with opener.open(request, timeout=max(0.1, min(timeout, DEFAULT_TIMEOUT_SECONDS))) as response:
+            response.read(MAX_SAMEAS_BYTES)
+            return {
+                "outcome": "retrieved",
+                "http_status": getattr(response, "status", None),
+            }
+    except HTTPError as exc:
+        return {
+            "outcome": "unavailable" if exc.code in (404, 410) else "error",
+            "http_status": exc.code,
+        }
+    except Exception as exc:
+        return {"outcome": "error", "http_status": None, "error": str(exc)}
+
+
+def verify_same_as(targets, user_agent, timeout, state) -> None:
     """
     Bounded corroboration probe.
 
@@ -434,25 +394,22 @@ def verify_same_as(targets, fetch, brand_names, timeout, state) -> None:
 
     unreachable = []
     checked = []
-
     for index, target in enumerate(targets):
         if index:
             time.sleep(POLITE_DELAY_SECONDS)
-        result = fetch.fetch_page(target, timeout=timeout, max_bytes=200 * 1024)
+        result = bounded_get(target, user_agent, timeout)
         checked.append({
             "url": target,
             "outcome": result.get("outcome"),
             "status": result.get("http_status"),
         })
-        if result.get("outcome") == "unavailable" and (result.get("http_status") or 0) in (404, 410):
+        if result.get("outcome") == "unavailable" and result.get("http_status") in (404, 410):
             unreachable.append(target)
 
     state["observations"].append(
         "sameAs verification: " + json.dumps(checked, sort_keys=True)
     )
-
     if unreachable:
-        # Bounded by what was actually probed, never by the size of the sample.
         scope, radius = site_scope(len(targets))
         state["findings"].append(finding(
             local_id="FC-005",
@@ -464,10 +421,8 @@ def verify_same_as(targets, fetch, brand_names, timeout, state) -> None:
                 "returned 404 or 410.",
                 "Unresolved: " + ", ".join(sorted(unreachable)),
             ],
-            stage_block=2,
-            fact_criticality=2,
-            scope=scope,
-            blast_radius=radius,
+            stage_block=2, fact_criticality=2,
+            scope=scope, blast_radius=radius,
             affected_urls=sorted(unreachable),
             action_summary=(
                 "Correct or remove the dead sameAs entries and point them at profiles "
@@ -549,33 +504,57 @@ def proactive() -> list[dict]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Assembly
-# ---------------------------------------------------------------------------
-
-def audit_pages(urls, fetch, user_agent, timeout, state) -> dict:
+def audit_pages(evidence: dict, state: dict) -> dict:
     analyses: dict[str, dict] = {}
+    pages = evidence.get("pages") or []
     failed = 0
+    missing_html = 0
 
-    for index, url in enumerate(sorted(set(urls))):
-        if index:
-            time.sleep(POLITE_DELAY_SECONDS)
-        result = fetch.fetch_page(url, user_agent=user_agent, timeout=timeout)
-        if result.get("outcome") != "retrieved":
-            failed += 1
-            continue
-        analyses[url] = analyze_identity(url, result.get("body") or "")
-
-    state["observations"].append(
-        f"Analysed {len(analyses)} of {len(set(urls))} sampled page(s)."
+    valid_pages = sorted(
+        [p for p in pages if isinstance(p, dict) and isinstance(p.get("url"), str)],
+        key=lambda p: p["url"],
     )
 
+    for page in valid_pages:
+        url = page["url"]
+        status = page.get("status")
+        error = page.get("error")
+
+        # Freshness/identity analysis now consumes normalized evidence, but the
+        # presence of HTML remains a useful collection guard because the contract
+        # explicitly treats missing page evidence as a limitation, not a defect.
+        html = page.get("html")
+        has_html = (
+            isinstance(html, dict) and isinstance(html.get("content"), str)
+        ) or isinstance(html, str)
+        if error or (status is not None and not (200 <= int(status) < 300)):
+            failed += 1
+            continue
+        if not has_html:
+            missing_html += 1
+            continue
+
+        analyses[url] = analyze_identity(url, page)
+
+    state["observations"].append(
+        f"Analysed {len(analyses)} of {len(valid_pages)} sampled page(s) from shared evidence."
+    )
     if failed:
         state["limitations"].append({
             "check": "page_retrieval",
             "reason": (
-                f"{failed} sampled page(s) could not be retrieved from this audit "
-                "environment; identity and freshness could not be assessed for them."
+                f"{failed} sampled page(s) have retrieval errors or non-2xx status in "
+                "evidence.json; identity and freshness could not be assessed for them."
+            ),
+            "affected_checks": ["entity_identity", "freshness"],
+        })
+        state["status"] = "partial_failure"
+    if missing_html:
+        state["limitations"].append({
+            "check": "page_evidence",
+            "reason": (
+                f"{missing_html} sampled page(s) have no usable html evidence in "
+                "evidence.json; identity/freshness checks were not run for those pages."
             ),
             "affected_checks": ["entity_identity", "freshness"],
         })
@@ -584,7 +563,7 @@ def audit_pages(urls, fetch, user_agent, timeout, state) -> dict:
     return analyses
 
 
-def run(url, user_agent, timeout, sample_file, check_external) -> dict:
+def run(url, evidence_file, user_agent, timeout, no_external) -> dict:
     state: dict = {
         "status": "success",
         "observations": [],
@@ -593,34 +572,37 @@ def run(url, user_agent, timeout, sample_file, check_external) -> dict:
         "proactive_recommendations": [],
     }
 
-    sample_urls, sample_limitation = load_sample(sample_file, url)
-    if sample_limitation:
+    evidence, error = load_evidence(evidence_file)
+    if evidence is None:
+        state["status"] = "failure"
         state["limitations"].append({
-            "check": "page_sample",
-            "reason": sample_limitation,
-            "affected_checks": ["scope_claims"],
+            "check": "evidence_input",
+            "reason": error or "Shared evidence could not be loaded.",
+            "affected_checks": ["all"],
         })
-    state["observations"].append(f"Shared page sample: {len(sample_urls)} URL(s).")
-
-    fetch, fetch_error = load_sibling("fetch")
-    if fetch is None:
-        state["limitations"].append({
-            "check": "page_retrieval",
-            "reason": fetch_error or "fetch.py is unavailable.",
-            "affected_checks": ["all_identity_and_freshness_checks"],
-        })
-        state["status"] = "partial_failure"
         return finalize(state)
 
-    parts = urlsplit(url)
+    pages = evidence.get("pages") or []
+    state["observations"].append(f"Shared evidence contains {len(pages)} sampled page(s).")
+
+    if not pages:
+        state["status"] = "partial_failure"
+        state["limitations"].append({
+            "check": "page_sample",
+            "reason": "Shared evidence contains no sampled pages; no identity/freshness checks were run.",
+            "affected_checks": ["all_identity_and_freshness_checks"],
+        })
+        return finalize(state)
+
+    parts = urlsplit(str(evidence.get("site") or url))
     origin = f"{parts.scheme or 'https'}://{parts.netloc}"
+    analyses = audit_pages(evidence, state)
+    if not analyses:
+        return finalize(state)
 
-    analyses = audit_pages(sample_urls, fetch, user_agent, timeout, state)
     targets = evaluate(analyses, origin, state)
-
-    if check_external:
-        brand_names = sorted({n for u in analyses for n in analyses[u]["identity_names"]})
-        verify_same_as(targets, fetch, brand_names, timeout, state)
+    if not no_external:
+        verify_same_as(targets, user_agent, timeout, state)
     else:
         state["limitations"].append({
             "check": "external_corroboration",
@@ -628,9 +610,7 @@ def run(url, user_agent, timeout, sample_file, check_external) -> dict:
             "affected_checks": ["third_party_agreement"],
         })
 
-    if analyses:
-        state["proactive_recommendations"] = proactive()
-
+    state["proactive_recommendations"] = proactive()
     return finalize(state)
 
 
@@ -653,6 +633,7 @@ def main() -> int:
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--budget-ms", type=int, default=DEFAULT_BUDGET_MS)
+    parser.add_argument("--evidence-file", default=None)
     parser.add_argument("--sample-file", default=None)
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument(
@@ -660,7 +641,6 @@ def main() -> int:
         action="store_true",
         help="Skip verification of declared sameAs targets.",
     )
-
     args = parser.parse_args()
 
     if not args.url or not args.url.strip():
@@ -671,15 +651,20 @@ def main() -> int:
                 "reason": "No target URL supplied.",
                 "affected_checks": ["all"],
             }],
+            "proactive_recommendations": [],
         }, indent=2))
         return 2
 
     started = time.monotonic()
-
     try:
-        result = run(args.url.strip(), args.user_agent, args.timeout,
-                     args.sample_file, not args.no_external)
-    except Exception as exc:  # pragma: no cover - fault isolation boundary
+        result = run(
+            args.url.strip(),
+            args.evidence_file,
+            args.user_agent,
+            args.timeout,
+            args.no_external,
+        )
+    except Exception as exc:
         result = {
             "skill": SKILL_ID, "status": "failure", "observations": [],
             "findings": [], "limitations": [{
@@ -687,6 +672,7 @@ def main() -> int:
                 "reason": f"Unhandled error during audit: {type(exc).__name__}: {exc}",
                 "affected_checks": ["all"],
             }],
+            "proactive_recommendations": [],
         }
 
     elapsed_ms = int((time.monotonic() - started) * 1000)

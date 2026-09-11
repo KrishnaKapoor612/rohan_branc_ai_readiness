@@ -36,31 +36,54 @@ Required:
 
 ## Execution
 
-The skill may use the bundled scripts in `scripts/` to perform deterministic
-read-only checks.
+This skill is an **analysis specialist**, not a page retriever. Crawling,
+robots-permission checks, fetching, sampling and (optional) headless rendering
+are all performed once, upstream, by `audit-orchestrator/scripts/evidence.py`,
+which writes the shared `evidence.json`. This skill folder intentionally does
+not bundle `robots.py`, `fetch.py`, `render.py` or `sitemap.py`. Those live
+only under `audit-orchestrator/scripts/` and are invoked once, upstream, by
+`audit-orchestrator/scripts/evidence.py` — see the specialist contract in
+`audit-orchestrator/references/specialist-contract.md`.
 
 For a target URL:
 
-1. Run `scripts/robots.py <url>` before attempting page crawling.
-2. Use its structured JSON result to determine whether crawling may proceed.
-3. If crawling is permitted, run `scripts/fetch.py <url>`.
-4. If rendering is required, run `scripts/render.py <url>`.
-5. Use `scripts/sitemap.py <url> --emit-sample` to produce the shared page
-   sample the whole marketplace audits. This skill declares
-   `"provides": ["page_sample"]` in the manifest and is the sample producer.
-6. Use `scripts/check.py <url> --sample-file PATH` to combine the crawl,
-   retrieval, rendering, user-agent differential and machine-readability
-   evidence into the specialist result. Every scope claim is bounded by the
-   sample; `blast_radius` follows the affected-to-sampled ratio and is never
-   inferred from a single page.
+1. Load the shared evidence with `scripts/check.py <url> --evidence-file PATH`.
+2. Reason over `evidence["site_level"]["robots"]` and `evidence["pages"][*]`
+   (`robots_allowed`, `status`, `html`, `jsonld`, `page_structure`, `render`)
+   to determine crawl permission, retrieval outcomes, extractability and
+   render-diff findings. Do not re-fetch, re-crawl, or independently sample.
+3. Every scope claim is bounded by the sampled pages in the evidence file;
+   `blast_radius` follows the affected-to-sampled ratio and is never inferred
+   from a single page.
 
-`scripts/render.py` is optional. It probes for a headless browser and reports
-`available: false` when none exists, in which case client-side dependence is
-inferred from hydration markers and reported at medium confidence rather than
-asserted.
+Rendering, when it happened, is recorded per page under `page["render"]`
+(`attempted`, `available`, `signals`). If `available` is `false`, no headless
+browser was present in the collection environment, and client-side dependence
+is instead inferred from hydration markers in `page_structure` and reported at
+medium confidence rather than asserted. This skill never invokes rendering
+itself and never attempts to install a browser binary — see "Rendering
+guardrail" below.
 
 Scripts must remain read-only, bounded, and must not bypass robots.txt,
 authentication, CAPTCHA, WAF, paywalls, or other access restrictions.
+
+
+## Rendering guardrail
+
+If rendered evidence is unavailable (`page["render"]["available"]` is `false`),
+treat that as a fact about the collection environment, not a problem to solve.
+
+Do not attempt to `pip install playwright`, run `playwright install chromium`,
+download a browser binary, or shell out to any installer mid-audit. Doing so
+risks the marketplace's runtime budget — a Chromium download alone can exceed
+the 5-minute ceiling — and risks violating the Python/Node.js-only environment
+constraint this marketplace operates under.
+
+When rendering was unavailable, report it as such and continue reasoning from
+`page["page_structure"]`'s hydration markers at medium confidence, exactly as
+`evidence.py`'s collection layer already does. Never assert a render-dependent
+finding at high confidence when `available` is `false` — downgrade confidence
+instead of inventing certainty the evidence doesn't support.
 
 ## Procedure
 

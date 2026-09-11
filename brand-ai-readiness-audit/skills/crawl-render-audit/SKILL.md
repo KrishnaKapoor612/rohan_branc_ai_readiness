@@ -87,92 +87,49 @@ instead of inventing certainty the evidence doesn't support.
 
 ## Procedure
 
-1. Normalize and validate the target URL.
+## Procedure
 
-2. Check the applicable `robots.txt` rules before crawling.
+1. Load the shared evidence file (`--evidence-file`). Confirm it contains a
+   `pages` array; if not, record a limitation and stop.
 
-   - Respect `robots.txt`.
-   - Do not bypass a disallow rule.
-   - Record when a requested check cannot be performed because crawling is disallowed, including the applicable robots.txt rule when it can be determined.
+2. Read `evidence["site_level"]["robots"]` and each page's `robots_allowed`
+   field. Do not re-check robots.txt yourself — reason over what was already
+   determined upstream.
 
-3. Discover available sitemap resources.
+3. Read the sample composition already present in the evidence file. Do not
+   discover or crawl sitemaps yourself; sampling was already bounded upstream
+   by `evidence.py`/`sitemap.py`.
 
-   - Check for `Sitemap:` declarations in `robots.txt`.
-   - Check the conventional `/sitemap.xml` location when permitted.
-   - Follow sitemap indexes only within the audit's bounded crawl limits.
-   - Record discovered sitemap URLs and the number of URLs available for inspection where determinable.
-   - Use sitemap URLs to identify representative pages for bounded auditing when appropriate.
-   - Do not treat the absence of a sitemap as a defect by itself.
-   - Do not crawl an unbounded number of sitemap URLs.
+4. For each page, read the retrieval outcome already recorded: `status`,
+   `final_url`, redirect info, `error`, and `limitations`. Classify access
+   failures from these recorded fields — do not attempt retrieval yourself.
 
-4. Perform permitted HTTP retrieval.
+5. Classify access failures by the observed fields already present (HTTP
+   status, error type, limitations) rather than by performing your own
+   requests.
 
-   Record deterministic observations including, where applicable:
+6. Read `page["html"]` — the initial HTML response is already preserved in
+   the evidence file.
 
-   - DNS/connectivity result;
-   - TLS/SSL result;
-   - HTTP status;
-   - response URL;
-   - redirect chain;
-   - request duration;
-   - timeout;
-   - response content type;
-   - whether usable HTML was returned.
+7. Extract machine-readable content signals from what's already computed:
+   `page["jsonld"]`, `page["page_structure"]`, headings, links — do not
+   re-parse HTML from scratch where evidence.py has already extracted it.
 
-5. Classify access failures by observed behavior.
+8. Read `page["render"]` (`attempted`, `available`, `signals`) for whether
+   rendering happened upstream and what it found. Do not render pages
+   yourself — see the Rendering guardrail above.
 
-   Possible observations include:
+9. Compare `page["render"]["signals"]` fields (`server_text_chars`,
+   `text_chars`, `gained_chars`) — this diff was already computed upstream;
+   reason over it rather than performing your own comparison.
 
-   - HTTP 403 or other access-denied responses;
-   - authentication requirements;
-   - CAPTCHA or anti-bot challenges;
-   - paywall or partial-content barriers;
-   - environment-specific geographic or network restrictions;
-   - redirect loops or excessive redirect chains;
-   - connection or TLS failures;
-   - request timeouts.
+10. Check for important facts represented through images, video, canvas, or
+    other non-textual components, using the text/structure signals already
+    present in the evidence file.
 
-   Do not claim a specific underlying cause such as WAF, bot protection, IP restriction, or server policy unless the available evidence supports that conclusion.
-
-6. Preserve the initial HTML response when retrieval succeeds.
-
-7. Extract machine-readable content from the initial response.
-
-   Examine, where applicable:
-
-   - readable text;
-   - page title and metadata;
-   - headings;
-   - links and navigational paths;
-   - structured data such as JSON-LD;
-   - important factual content exposed directly in the HTML.
-
-   Treat these as observations and evidence. Do not classify the absence of any single element as a defect without considering whether the missing element materially affects machine extraction of important information.
-
-8. Render the page when permitted and when rendering is useful for determining whether important content depends on client-side execution.
-
-9. Compare the initial HTML with the rendered page.
-
-   - Identify meaningful differences in machine-readable content.
-   - Determine whether important factual content is available only after rendering.
-   - Do not treat JavaScript usage itself as a defect.
-   - Record measurable differences where possible.
-
-10. Check important factual content for non-textual exposure.
-
-   - Identify important facts represented through images, video, canvas, graphical text, or other non-textual components.
-   - Determine whether an equivalent, clearly readable representation is available in the inspected HTML or rendered text.
-   - Do not treat the presence of non-textual content itself as a defect.
-   - Create a finding only when evidence indicates that important information lacks an accessible machine-readable representation.
-
-11. Produce a specialist result.
-
-   The result must distinguish:
-
-   - confirmed findings;
-   - observations that do not meet the threshold for a finding;
-   - audit limitations caused by failed or unavailable checks.
-
+11. Produce a specialist result distinguishing confirmed findings,
+    observations, and limitations.
+    
 ## Evidence Rules
 
 Every confirmed finding must be supported by concrete observations from the audit.

@@ -11,8 +11,7 @@
     },
     {
       "id": "crawl-render-audit",
-      "path": "skills/crawl-render-audit",
-      "provides": ["page_sample"]
+      "path": "skills/crawl-render-audit"
     },
     {
       "id": "freshness-corroboration-audit",

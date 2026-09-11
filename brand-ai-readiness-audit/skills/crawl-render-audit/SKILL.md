@@ -87,8 +87,6 @@ instead of inventing certainty the evidence doesn't support.
 
 ## Procedure
 
-## Procedure
-
 1. Load the shared evidence file (`--evidence-file`). Confirm it contains a
    `pages` array; if not, record a limitation and stop.
 
@@ -172,8 +170,7 @@ Examples:
 
 This skill owns:
 
-- access and retrieval;
-- crawl permission;
+- interpreting access, retrieval, and crawl-permission signals already collected upstream;
 - HTTP behavior;
 - redirects;
 - TLS/connectivity;
@@ -198,7 +195,7 @@ Those concerns belong to other specialist skills in the marketplace.
 - Never modify website content or configuration.
 - Never authenticate to protected areas.
 - Never bypass CAPTCHA, WAF, access controls, paywalls, robots.txt, or other restrictions.
-- Do not attempt independent retrieval, crawling, or rendering; all bounding and rate-limiting of live requests is enforced upstream by `evidence.py`.This skill only interprets already-collected evidence.
+- Do not attempt independent retrieval, crawling, or rendering; all bounding and rate-limiting of live requests is enforced upstream by `evidence.py`. This skill only interprets already-collected evidence.
 - Respect the marketplace runtime budget.
 - Do not require an external service to interpret the marketplace.
 

@@ -67,7 +67,7 @@ IDENTITY_JSONLD_TYPES = {
 }
 
 DATE_JSONLD_KEYS = (
-    "datemodified", "datepublished", "datecreated", "uploaddate",
+    "dateModified", "datePublished", "dateCreated", "uploadDate",
 )
 
 SEARCH_UI_HINTS = re.compile(

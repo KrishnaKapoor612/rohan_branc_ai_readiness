@@ -14,8 +14,7 @@ Use this skill for the on-site half of the brand AI-readiness problem: the
 visitor who arrives mid-journey, primed by an assistant's summary, and leaves
 within seconds without engaging.
 
-It is invoked by the marketplace entrypoint, `audit-orchestrator`. It can also
-run standalone against a single URL.
+It is invoked by the marketplace entrypoint, `audit-orchestrator`.
 
 ## The failure it measures
 
@@ -39,40 +38,53 @@ Required:
 
 Optional:
 
-- `--sample-file` — the shared page sample from the orchestrator. Every scope
-  claim this skill makes is bounded by this list. Without it only the target URL
-  is audited and a limitation is recorded.
+- `--evidence-file` — the shared `evidence.json` produced once by
+  `audit-orchestrator/scripts/evidence.py`. Every scope claim this skill makes
+  is bounded by the pages present in this file. Without it, the skill records
+  a limitation and emits no findings — it does not fetch pages itself.
+- `--sample-file` — deprecated, accepted only so an older orchestrator does not
+  fail argument parsing. Not read.
 - `--user-agent`, `--timeout`, `--budget-ms`, `--no-render`.
 
 ## Execution
 
-`scripts/check.py <url> [--sample-file PATH]`
+`scripts/check.py <url> --evidence-file PATH`
 
-`scripts/fetch.py` is bundled so the skill folder is self-contained and
-independently valid. If `robots.py` is present it is consulted first; otherwise
-crawl permission is enforced upstream by `crawl-render-audit` and by the shared
-sample, and that is recorded as an observation rather than assumed.
+This skill is an **analysis specialist**, not a page retriever. It consumes
+the shared `evidence.json` and does not fetch pages or import `fetch.py`/
+`robots.py` — those files are not bundled here and live only under
+`audit-orchestrator/scripts/`. Crawl permission for the sampled pages was
+already decided once, upstream, by `evidence.py` (`robots_allowed` on each
+page in the evidence file); this skill treats that field as authoritative
+and does not re-derive or re-check it.
 
 ## Procedure
 
-1. Load the shared page sample. Record a limitation if none was supplied.
-2. Confirm crawl permission where a robots inspector is available. If the target
-   is disallowed, do not retrieve, and record a limitation.
-3. Retrieve each sampled page once, with a polite delay between requests.
-4. For each page, measure only observable structure:
-   - h2/h3 headings, and how many carry an `id`;
-   - distinct same-origin links present in the initial HTML;
-   - presence of a `main`/`article` landmark and of an `h1`;
-   - presence of a search input the visitor could recover with;
-   - breadcrumb markup or `BreadcrumbList` structured data;
+1. Load the shared evidence file (`--evidence-file`). Record a limitation
+   if none was supplied, or if it contains no usable `pages` array.
+2. Read each page's `robots_allowed` field, already determined upstream.
+   Do not re-check robots.txt yourself. A page marked disallowed is treated
+   as excluded from analysis, not retried.
+3. For each page already present in the evidence file, read the
+   already-collected data rather than retrieving anything:
+   - `page["headings"]` for h2/h3 headings, and how many carry an `id`;
+   - `page["links"]` for distinct same-origin link counts already extracted
+     from the initial HTML;
+   - `page["page_structure"]` for presence of a `main`/`article` landmark
+     and of an `h1`;
+   - `page["engagement_signals"]["search_ui_detected"]` for presence of a
+     search input the visitor could recover with;
+   - breadcrumb markup or `BreadcrumbList` structured data, matched directly
+     against `page["html"]` — the initial HTML already collected upstream,
+     not re-fetched;
    - a modal structure, consent vocabulary, and a scroll lock, measured
-     separately;
-   - words of readable text.
-5. Convert measurements into findings only where the thresholds below are met.
-6. Set `blast_radius` from the ratio of affected pages to sampled pages, never
+     separately from `page["html"]`/`page["engagement_signals"]`;
+   - words of readable text, from `page["page_structure"]`.
+4. Convert measurements into findings only where the thresholds below are met.
+5. Set `blast_radius` from the ratio of affected pages to sampled pages, never
    from a single page.
-7. Emit `severity_inputs`, never a severity label.
-8. Emit proactive recommendations that strengthen the handoff even where no
+6. Emit `severity_inputs`, never a severity label.
+7. Emit proactive recommendations that strengthen the handoff even where no
    defect was found.
 
 ## Detection thresholds
@@ -93,8 +105,8 @@ left to that skill.
 ## Evidence rules
 
 Every finding states a ratio over the sampled pages, names an example URL, and
-reports what was measured rather than what it implies. A check that could not
-run becomes a limitation. A single unretrievable page never becomes a claim
+reports what was measured rather than what it implies. A page missing from the
+evidence file, or carrying a retrieval error/limitation, never becomes a claim
 about the site.
 
 ## Scope boundaries
@@ -109,12 +121,15 @@ orchestrator never receives one root cause twice.
 
 ## Safety and operational guardrails
 
-- Read-only. GET only, no form submission, no clicks, no state change.
+- Read-only analysis only. This skill makes no network requests of any kind —
+  it reads only the shared `evidence.json` already collected upstream.
 - Never authenticates, never bypasses robots.txt, a consent wall, a CAPTCHA or a
-  WAF. A consent wall is detected by reading the markup, never by dismissing it.
-- One request per sampled page, polite delay between requests, bounded bytes,
-  bounded redirects, TLS verified.
-- No third-party packages and no network access outside the target origin.
+  WAF. A consent wall is detected by reading markup already present in the
+  supplied evidence, never by dismissing it or fetching a page to check.
+- Do not independently crawl, fetch, or re-request any page already covered by
+  the shared evidence; all such retrieval bounding, rate-limiting, and TLS
+  verification is enforced upstream by `evidence.py`.
+- No third-party packages and no network access at all.
 
 ## Output
 

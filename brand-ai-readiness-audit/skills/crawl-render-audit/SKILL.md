@@ -129,7 +129,7 @@ instead of inventing certainty the evidence doesn't support.
 
 11. Produce a specialist result distinguishing confirmed findings,
     observations, and limitations.
-    
+
 ## Evidence Rules
 
 Every confirmed finding must be supported by concrete observations from the audit.
@@ -179,8 +179,7 @@ This skill owns:
 - TLS/connectivity;
 - timeout handling;
 - raw HTML inspection;
-- permitted browser rendering;
-- initial-versus-rendered content comparison;
+- interpreting rendered-vs-initial content signals already collected upstream;
 - machine-readable content extraction;
 - non-textual fact exposure.
 
@@ -199,8 +198,7 @@ Those concerns belong to other specialist skills in the marketplace.
 - Never modify website content or configuration.
 - Never authenticate to protected areas.
 - Never bypass CAPTCHA, WAF, access controls, paywalls, robots.txt, or other restrictions.
-- Do not perform rate-abusive crawling.
-- Keep crawling bounded and relevant to the audit.
+- Do not attempt independent retrieval, crawling, or rendering; all bounding and rate-limiting of live requests is enforced upstream by `evidence.py`.This skill only interprets already-collected evidence.
 - Respect the marketplace runtime budget.
 - Do not require an external service to interpret the marketplace.
 

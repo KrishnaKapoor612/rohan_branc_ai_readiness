@@ -81,6 +81,7 @@ def analyze_identity(url: str, page: dict) -> dict:
         jsonld = []
 
     identity_blocks = []
+    identity_entities = []
     jsonld_nodes = 0
     names = set()
     same_as = set()
@@ -99,6 +100,15 @@ def analyze_identity(url: str, page: dict) -> dict:
         jsonld_nodes += 1
         if types & IDENTITY_TYPES:
             identity_blocks.append(block)
+
+            for name in block.get("names") or []:
+                if not isinstance(name, str) or not name.strip():
+                 continue
+
+                identity_entities.append({
+                   "types": sorted(types),
+                    "name": name.strip(),
+        })
         for name in block.get("names") or []:
             if isinstance(name, str) and name.strip():
                 names.add(name.strip())
@@ -134,6 +144,7 @@ def analyze_identity(url: str, page: dict) -> dict:
         date_signals = []
 
     page_structure = page.get("page_structure") or {}
+    time_sensitive = bool(page.get("time_sensitive"))
     text_chars = page_structure.get("text_chars")
     if not isinstance(text_chars, (int, float)):
         text_chars = 0
@@ -143,9 +154,11 @@ def analyze_identity(url: str, page: dict) -> dict:
         "jsonld_nodes": jsonld_nodes,
         "identity_nodes": len(identity_blocks),
         "identity_names": sorted(names),
+        "identity_entities": identity_entities,
         "same_as": sorted(same_as),
         "og_site_name": og_site_name,
         "has_date_signal": bool(date_signals),
+        "time_sensitive": time_sensitive,
         "text_chars": int(text_chars),
     }
 
@@ -254,70 +267,127 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
         )
 
     # --- 2. Identity declared but not linked outward ----------------------
-    elif not all_same_as:
-        state["findings"].append(finding(
-            local_id="FC-002",
-            title="Identity node declares no sameAs links, so the brand is not tied to any external record",
-            category="entity_identity",
-            stage="unambiguous",
-            evidence=[
-                f"{len(identity_pages)} of {total} sampled page(s) declare an identity "
-                "node, and none of them include a sameAs property.",
-                f"Declared name(s): "
-                f"{', '.join(sorted({n for u in pages for n in analyses[u]['identity_names']})) or 'none'}.",
-            ],
-            stage_block=2, fact_criticality=3,
-            scope=site_wide_scope, blast_radius=site_wide_radius,
-            affected_urls=identity_pages[:12],
-            action_summary=(
-                "Add a sameAs array to the Organization node listing the brand's "
-                "Wikidata item, official social profiles, app store listings and any "
-                "registry entry, and keep those profiles consistent with the site."
-            ),
-            action_rationale=(
-                "sameAs is what converts a name into an identity. It gives a machine "
-                "independent records to pivot on, which is both how ambiguity gets "
-                "resolved and how a claim on the site becomes corroborated rather than "
-                "self-reported."
-            ),
-            effort="low",
-            verify_by="Re-run this audit and confirm same_as is non-empty.",
-        ))
 
+    elif not all_same_as:
+        state["observations"].append(
+            "Identity nodes were found, but no sameAs links were declared in "
+            "the sample. This is recorded as an observation rather than an "
+            "identity defect because absence of sameAs alone does not establish "
+            "ambiguity or incorrect identity."
+        )
     # --- 3. Conflicting names for the same entity -------------------------
-    declared = {n for u in pages for n in analyses[u]["identity_names"]}
-    og_names = {analyses[u]["og_site_name"] for u in pages if analyses[u]["og_site_name"]}
-    combined = {n.strip().lower() for n in (declared | og_names) if n}
-    if len(combined) > 1:
+
+    # Compare only Organization-like identity nodes with each other.
+    # LocalBusiness/Store names can legitimately differ by location, while
+    # WebSite/Brand names can describe the same broader entity. Different
+    # entity types must not automatically be treated as conflicting names.
+
+    organization_types = {
+        "organization",
+        "corporation",
+        "ngo",
+        "educationalorganization",
+    }
+
+    organization_names = set()
+
+    for u in pages:
+        for entity in analyses[u].get("identity_entities", []):
+            if not isinstance(entity, dict):
+                continue
+
+            types = {
+                str(t).strip().lower()
+                for t in (entity.get("types") or [])
+                if isinstance(t, str) and t.strip()
+            }
+
+            name = entity.get("name")
+
+            if (
+                types & organization_types
+                and isinstance(name, str)
+                and name.strip()
+            ):
+                organization_names.add(name.strip())
+
+    normalized_org_names = {
+        re.sub(r"\s+", " ", name).strip().casefold()
+        for name in organization_names
+    }
+
+    if len(normalized_org_names) > 1:
+        affected_identity_urls = []
+
+        for u in pages:
+            for entity in analyses[u].get("identity_entities", []):
+                if not isinstance(entity, dict):
+                    continue
+
+                types = {
+                    str(t).strip().lower()
+                    for t in (entity.get("types") or [])
+                    if isinstance(t, str) and t.strip()
+                }
+
+                name = entity.get("name")
+
+                if (
+                    types & organization_types
+                    and isinstance(name, str)
+                    and name.strip()
+                ):
+                    affected_identity_urls.append(u)
+                    break
+
+        scope, radius = scope_from_ratio(
+            len(affected_identity_urls),
+            total,
+        )
+
         state["findings"].append(finding(
             local_id="FC-003",
-            title="The site states more than one name for itself",
+            title="Organization identity is declared inconsistently across the sample",
             category="entity_identity",
             stage="unambiguous",
             evidence=[
-                f"Distinct entity names found across the sample: "
-                f"{', '.join(sorted(declared | og_names))}.",
-                "Sources compared: JSON-LD identity node name and og:site_name.",
+                f"Distinct Organization-type names found across the sample: "
+                f"{', '.join(sorted(organization_names))}.",
+                "Comparison was limited to Organization-like JSON-LD identity "
+                "nodes; LocalBusiness, Store, WebSite and Brand names were not "
+                "treated as competing organization identities.",
             ],
-            stage_block=2, fact_criticality=3,
-            scope=site_wide_scope, blast_radius=site_wide_radius,
-            affected_urls=pages[:12],
+            stage_block=2,
+            fact_criticality=3,
+            scope=scope,
+            blast_radius=radius,
+            affected_urls=affected_identity_urls[:12],
             action_summary=(
-                "Choose one canonical name string and use it identically in the "
-                "Organization node, og:site_name and the title suffix. Express any "
-                "trading names through alternateName rather than by varying the primary name."
+                "Choose one canonical organization name and use it consistently "
+                "across Organization JSON-LD, og:site_name and other primary "
+                "identity metadata."
             ),
             action_rationale=(
-                "Agreement is what makes a fact repeatable. When a site disagrees with "
-                "itself about its own name, no external source can corroborate either "
-                "version, and a retrieval system has no basis to prefer one."
+                "Different names can legitimately describe stores, brands, "
+                "websites or other properties. A finding is warranted only when "
+                "Organization-like identity nodes themselves declare materially "
+                "different primary names."
             ),
             effort="low",
-            verify_by="Re-run this audit and confirm a single canonical name is reported.",
+            verify_by=(
+                "Re-run this audit and confirm Organization-type identity nodes "
+                "use a consistent canonical name."
+            ),
         ))
 
-    # --- 4. Undated claims -------------------------------------------------
-    undated = [u for u in pages if not analyses[u]["has_date_signal"]]
+    # --- 4. Undated time-sensitive claims -------------------------------
+
+    undated = [
+        u
+        for u in pages
+        if analyses[u]["time_sensitive"]
+        and not analyses[u]["has_date_signal"]
+    ]
     if undated:
         scope, radius = scope_from_ratio(len(undated), total)
         state["findings"].append(finding(

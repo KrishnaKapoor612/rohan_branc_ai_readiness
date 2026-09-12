@@ -54,7 +54,7 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 
 # Bounds. Round-3 runtime expectation is under five minutes for a typical
 # site, and the evidence file itself must stay a practical size.
-MAX_HTML_BYTES_PER_PAGE = 60_000          # raw HTML stored per page, truncated beyond this
+MAX_HTML_BYTES_PER_PAGE = 300_000          # raw HTML stored per page, truncated beyond this
 MAX_FETCH_BYTES_PER_PAGE = 2 * 1024 * 1024  # bytes actually requested from the network
 MAX_RENDER_PAGES = 3                        # rendering is the slow path; bound it hard
 MAX_SAME_AS_CHECKS = 3                      # explicit bound from the problem statement
@@ -634,6 +634,13 @@ def collect(
             "page_structure": extract_page_structure(body, text),
             "render": {"attempted": False, "available": False, "signals": {}},
         })
+        
+        if page["html"]["status"] == "truncated":
+           page["limitations"].append(
+               "Stored HTML evidence was truncated at "
+               f"{MAX_HTML_BYTES_PER_PAGE} bytes. "
+               "Absence-based conclusions from the stored HTML may be incomplete."
+      )
 
         if render_enabled and render is not None and rendered_so_far < max_render_pages:
             rendered_so_far += 1

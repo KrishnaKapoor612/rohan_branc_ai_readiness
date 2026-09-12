@@ -193,3 +193,11 @@ final audit report
 - Specialists must not independently fetch the same sampled pages already covered by shared evidence.
 - Collection or specialist failures are recorded as limitations rather than converted into findings.
 - Findings must be supported by evidence actually collected during the audit.
++- Rendering is optional. If no headless browser is available in the runtime
+  environment, `render.py` reports `available: false` and the pipeline
+  continues normally using hydration-marker inference instead. Never attempt
+  to `pip install playwright`, run `playwright install chromium`, download a
+  browser binary, or shell out to any installer to make rendering available —
+  this risks exceeding the 5-minute runtime budget and risks violating the
+  Python/Node.js-only environment constraint. A missing renderer is a fact
+  about the environment, not a problem to fix mid-audit.

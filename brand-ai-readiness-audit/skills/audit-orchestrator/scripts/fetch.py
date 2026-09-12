@@ -167,6 +167,7 @@ def fetch_page(
 
             content_type = response.headers.get("Content-Type")
             content_encoding = response.headers.get("Content-Encoding")
+            x_robots_tag = response.headers.get("X-Robots-Tag")
             decoded = _decompress(raw, content_encoding)
 
             body = decoded.decode(_charset(content_type), errors="replace")
@@ -178,6 +179,7 @@ def fetch_page(
                 redirect_chain=limiter.chain,
                 content_type=content_type,
                 content_encoding=content_encoding,
+                x_robots_tag=x_robots_tag,
                 body=body,
                 bytes=len(decoded),
                 truncated=truncated,
@@ -200,6 +202,7 @@ def fetch_page(
             final_url=exc.url if hasattr(exc, "url") else url,
             redirect_chain=limiter.chain,
             content_type=exc.headers.get("Content-Type") if exc.headers else None,
+            x_robots_tag=exc.headers.get("X-Robots-Tag") if exc.headers else None,
             body=body,
             bytes=size,
             error=f"HTTP {exc.code} {exc.reason}",

@@ -31,7 +31,7 @@ SKILL_ID = "crawl-render-audit"
 
 DEFAULT_USER_AGENT = (
     "BrandAIReadinessAuditBot/1.0 "
-    "(+https://github.com/KrishnaKapoor612/brand-ai-readiness-audit)"
+    "(+https://github.com/KrishnaKapoor612/rohan_branc_ai_readiness)"
 )
 
 DEFAULT_TIMEOUT_SECONDS = 8.0

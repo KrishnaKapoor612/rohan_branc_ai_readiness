@@ -46,7 +46,7 @@ SCHEMA_VERSION = "1.0"
 
 DEFAULT_USER_AGENT = (
     "BrandAIReadinessAuditBot/1.0 "
-    "(+https://github.com/KrishnaKapoor612/brand-ai-readiness-audit)"
+    "(+https://github.com/KrishnaKapoor612/rohan_branc_ai_readiness)"
 )
 
 DEFAULT_SAMPLE_LIMIT = 12

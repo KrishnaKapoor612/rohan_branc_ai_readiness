@@ -286,7 +286,72 @@ def stage_robots(evidence: dict, state: dict) -> None:
                 "tokens are no longer recorded as disallowed."
             ),
         ))
+        
+def detect_primary_access_failure(evidence: dict, state: dict) -> None:
+    """Emit a hard access finding when the primary page is unavailable."""
 
+    pages = evidence.get("pages") or []
+
+    if not pages:
+        return
+
+    primary = pages[0]
+    url = primary.get("url", "")
+    status = primary.get("status")
+    html = primary.get("html")
+    error = primary.get("error")
+
+    hard_failure = False
+    reason = ""
+
+    if isinstance(status, int) and status >= 400:
+        hard_failure = True
+        reason = f"HTTP {status}."
+
+    elif error:
+        hard_failure = True
+
+        if isinstance(error, dict):
+            message = error.get("message")
+        else:
+            message = str(error)
+
+        reason = message or "The primary page could not be retrieved."
+
+    elif not html:
+        hard_failure = True
+        reason = "The primary page returned no HTML evidence."
+
+    if not hard_failure:
+        return
+
+    state["findings"].append(finding(
+        local_id="CR-000",
+        title="Primary site page is not accessible",
+        category="access",
+        stage="reachable",
+        evidence=[
+            f"{url}: {reason}"
+        ],
+        stage_block=4,
+        fact_criticality=3,
+        blast_radius=3,
+        scope="site_wide",
+        affected_urls=[url],
+        action_summary=(
+            "Restore public access to the primary page so automated "
+            "readers can retrieve and analyze the site."
+        ),
+        action_rationale=(
+            "If the primary page cannot be retrieved, downstream "
+            "discoverability checks cannot be independently verified."
+        ),
+        effort="medium",
+        verify_by=(
+            "Re-run the audit and confirm the primary page is "
+            "successfully retrieved."
+        ),
+    ))
 
 def stage_retrieval(evidence: dict, state: dict) -> None:
     """Reason about page retrieval outcomes already collected."""
@@ -651,7 +716,8 @@ def run(
         })
         state["status"] = "partial_failure"
         return finalize(state)
-
+    
+    detect_primary_access_failure(evidence, state)
     stage_robots(evidence, state)
     stage_retrieval(evidence, state)
     stage_extractability(evidence, state)

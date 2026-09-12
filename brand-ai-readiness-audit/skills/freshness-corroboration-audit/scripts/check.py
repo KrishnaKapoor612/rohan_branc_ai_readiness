@@ -5,21 +5,18 @@ check.py -- specialist coordinator for the freshness-corroboration-audit skill.
 Owns the trust half of discoverability: identity, declared sameAs links and
 freshness signals. Page collection is owned by audit-orchestrator/evidence.py.
 
-This specialist does not import fetch.py or robots.py. The only network request
-remaining here is the explicitly permitted, bounded verification of declared
-sameAs URLs.
+This specialist does not import fetch.py or robots.py and does not make
+network requests. Page collection and bounded sameAs verification are owned
+by audit-orchestrator/evidence.py.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
-import ssl
 import sys
 import time
 from typing import Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 SKILL_ID = "freshness-corroboration-audit"
@@ -29,10 +26,8 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_BUDGET_MS = 90_000
-POLITE_DELAY_SECONDS = 0.4
 MAX_SAMEAS_CHECKS = 3
-MAX_SAMEAS_BYTES = 200 * 1024
-MAX_REDIRECTS = 3
+
 
 IDENTITY_TYPES = {
     "organization", "corporation", "localbusiness", "onlinestore",
@@ -420,78 +415,61 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
 
     return all_same_as[:MAX_SAMEAS_CHECKS]
 
-
-class _BoundedRedirectHandler(HTTPRedirectHandler):
-    def __init__(self, max_redirects: int) -> None:
-        super().__init__()
-        self.max_redirects = max_redirects
-        self.redirects = 0
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if self.redirects >= self.max_redirects:
-            raise URLError("maximum redirect limit reached")
-        self.redirects += 1
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def bounded_get(url: str, user_agent: str, timeout: float) -> dict:
-    """Bounded public GET used only for the explicit sameAs corroboration exception."""
-    handler = _BoundedRedirectHandler(MAX_REDIRECTS)
-    context = ssl.create_default_context()
-    from urllib.request import HTTPSHandler
-    opener = build_opener(handler, HTTPSHandler(context=context))
-    request = Request(
-        url,
-        headers={
-            "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
-        },
-        method="GET",
-    )
-    try:
-        with opener.open(request, timeout=max(0.1, min(timeout, DEFAULT_TIMEOUT_SECONDS))) as response:
-            response.read(MAX_SAMEAS_BYTES)
-            return {
-                "outcome": "retrieved",
-                "http_status": getattr(response, "status", None),
-            }
-    except HTTPError as exc:
-        return {
-            "outcome": "unavailable" if exc.code in (404, 410) else "error",
-            "http_status": exc.code,
-        }
-    except Exception as exc:
-        return {"outcome": "error", "http_status": None, "error": str(exc)}
-
-
-def verify_same_as(targets, user_agent, timeout, state) -> None:
+def verify_same_as(targets, evidence, state) -> None:
     """
-    Bounded corroboration probe.
+    Analyze sameAs verification already performed by evidence.py.
 
-    A declared sameAs link only corroborates the identity if the target actually
-    exists. This checks existence, not content quality, and reports at medium
-    confidence because a single environment can be blocked where a user is not.
+    This specialist does not make network requests. It consumes the bounded,
+    shared sameAs verification results from the canonical evidence.
     """
     if not targets:
         return
 
-    unreachable = []
+    corroboration = evidence.get("site_level", {}).get("corroboration", {})
+    checked_results = corroboration.get("same_as_checked") or []
+
+    checked_by_url = {
+        item.get("url"): item
+        for item in checked_results
+        if isinstance(item, dict) and item.get("url")
+    }
+
     checked = []
-    for index, target in enumerate(targets):
-        if index:
-            time.sleep(POLITE_DELAY_SECONDS)
-        result = bounded_get(target, user_agent, timeout)
+    unreachable = []
+
+    for target in targets:
+        result = checked_by_url.get(target)
+
+        if result is None:
+            continue
+
+        outcome = result.get("outcome")
+        status = result.get("http_status")
+
         checked.append({
             "url": target,
-            "outcome": result.get("outcome"),
-            "status": result.get("http_status"),
+            "outcome": outcome,
+            "status": status,
         })
-        if result.get("outcome") == "unavailable" and result.get("http_status") in (404, 410):
+
+        if outcome == "unavailable" and status in (404, 410):
             unreachable.append(target)
+
+    if not checked:
+        state["limitations"].append({
+            "check": "external_corroboration",
+            "reason": (
+                "Shared evidence did not contain verification results "
+                "for the declared sameAs targets."
+            ),
+            "affected_checks": ["third_party_agreement"],
+        })
+        return
 
     state["observations"].append(
         "sameAs verification: " + json.dumps(checked, sort_keys=True)
     )
+
     if unreachable:
         scope, radius = site_scope(len(targets))
         state["findings"].append(finding(
@@ -501,37 +479,27 @@ def verify_same_as(targets, user_agent, timeout, state) -> None:
             stage="corroborated",
             evidence=[
                 f"{len(unreachable)} of {len(targets)} checked sameAs target(s) "
-                "returned 404 or 410.",
+                f"returned 404 or 410.",
                 "Unresolved: " + ", ".join(sorted(unreachable)),
             ],
-            stage_block=2, fact_criticality=2,
-            scope=scope, blast_radius=radius,
+            stage_block=2,
+            fact_criticality=2,
+            blast_radius=radius,
+            scope=scope,
             affected_urls=sorted(unreachable),
             action_summary=(
-                "Correct or remove the dead sameAs entries and point them at profiles "
-                "that exist and name the same entity."
+                "Update or remove declared sameAs links that no longer resolve."
             ),
             action_rationale=(
-                "A sameAs link that leads nowhere corroborates nothing and weakens the "
-                "credibility of the identity block it sits in. A short accurate list "
-                "is worth more than a long aspirational one."
+                "Broken corroboration links weaken confidence in the site's "
+                "declared identity."
             ),
             effort="low",
-            verify_by="Re-run this audit and confirm every checked sameAs target resolves.",
-            confidence="medium",
+            verify_by=(
+                "Re-run the audit and confirm the declared sameAs targets "
+                "return successfully."
+            ),
         ))
-
-    state["limitations"].append({
-        "check": "external_corroboration",
-        "reason": (
-            f"Only {len(targets)} declared sameAs target(s) were checked, and only for "
-            "existence. Whether independent third-party sources agree with the site's "
-            "claims was not assessed; that requires querying the open web, which this "
-            "marketplace deliberately does not do."
-        ),
-        "affected_checks": ["third_party_agreement", "contradiction_detection"],
-    })
-
 
 def proactive() -> list[dict]:
     return [
@@ -685,7 +653,7 @@ def run(url, evidence_file, user_agent, timeout, no_external) -> dict:
 
     targets = evaluate(analyses, origin, state)
     if not no_external:
-        verify_same_as(targets, user_agent, timeout, state)
+        verify_same_as(targets, evidence, state)
     else:
         state["limitations"].append({
             "check": "external_corroboration",
@@ -722,7 +690,7 @@ def main() -> int:
     parser.add_argument(
         "--no-external",
         action="store_true",
-        help="Skip verification of declared sameAs targets.",
+        help="Skip analysis of shared sameAs verification results.",
     )
     args = parser.parse_args()
 

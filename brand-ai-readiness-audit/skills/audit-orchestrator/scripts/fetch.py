@@ -30,6 +30,8 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+import ipaddress
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -51,6 +53,43 @@ MAX_REDIRECTS = 5
 MAX_BODY_BYTES = 2 * 1024 * 1024
 POLITE_DELAY_SECONDS = 1.0
 
+def _validate_fetch_url(url: str) -> tuple[bool, Optional[str]]:
+    parsed = urlparse(url)
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False, (
+            f"Unsupported URL scheme: "
+            f"{parsed.scheme or '<missing>'}"
+        )
+
+    if not parsed.hostname:
+        return False, "URL has no hostname"
+
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+
+        for address in addresses:
+            ip = ipaddress.ip_address(address[4][0])
+
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False, (
+                    f"URL resolves to a non-public IP address: {ip}"
+                )
+
+    except OSError as exc:
+        return False, f"Hostname resolution failed: {exc}"
+
+    return True, None
 
 class RedirectLimiter(urllib.request.HTTPRedirectHandler):
     """Bounds the redirect chain and records every hop as evidence."""
@@ -72,9 +111,20 @@ class RedirectLimiter(urllib.request.HTTPRedirectHandler):
                 req.full_url, code,
                 f"Exceeded {self.maximum} redirects", headers, fp,
             )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+        valid, validation_error = _validate_fetch_url(newurl)
+        if not valid:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                validation_error or "Invalid redirect destination",
+                headers,
+                fp,
+            )
 
+        return super().redirect_request(
+            req, fp, code, msg, headers, newurl
+        )
 @dataclass
 class FetchResult:
     outcome: str  # retrieved | unavailable | error
@@ -146,7 +196,16 @@ def fetch_page(
     never, on its own, a statement about the site's availability to others.
     """
     started = time.monotonic()
-
+    valid, validation_error = _validate_fetch_url(url)
+    if not valid:
+        return FetchResult(
+            outcome="error",
+            final_url=url,
+            error=validation_error,
+            duration_ms=int(
+                (time.monotonic() - started) * 1000
+            ),
+        ).as_dict()
     limiter = RedirectLimiter()
     opener = urllib.request.build_opener(limiter)
 

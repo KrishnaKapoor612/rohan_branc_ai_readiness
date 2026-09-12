@@ -208,12 +208,17 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
     site_wide_scope, site_wide_radius = site_scope(total)
     all_same_as = sorted({s for u in pages for s in analyses[u]["same_as"]})
     identity_pages = [u for u in pages if analyses[u]["identity_nodes"] > 0]
-
+    identity_pages_incl_metadata = [
+        u for u in pages
+        if analyses[u]["identity_nodes"] > 0
+        or analyses[u]["og_site_name"]
+        or analyses[u]["identity_names"]
+    ]
     # --- 1. No declared identity -----------------------------------------
-    if not identity_pages:
+    if not identity_pages_incl_metadata:
         state["findings"].append(finding(
             local_id="FC-001",
-            title="No Organization or equivalent identity node is declared anywhere in the sample",
+            title="No identity signal of any kind (JSON-LD, title, or og:site_name) is declared anywhere in the sample",
             category="entity_identity",
             stage="unambiguous",
             evidence=[
@@ -239,6 +244,14 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
             effort="low",
             verify_by="Re-run this audit and confirm identity_nodes is at least 1.",
         ))
+    # --- 1b. Identity only via title/og:site_name, no JSON-LD --------------
+    elif not identity_pages:
+        state["observations"].append(
+            "No JSON-LD identity node (Organization/LocalBusiness/etc.) was "
+            "found, but title/og:site_name identity is present. Recorded as "
+            "an observation, not a finding, per this skill's own identity "
+            "finding rule."
+        )
 
     # --- 2. Identity declared but not linked outward ----------------------
     elif not all_same_as:

@@ -1,215 +1,404 @@
 # brand-ai-readiness-audit
 
-An Agent Skill Marketplace that audits any website for **AI discoverability**
-(getting found and cited by assistants) and **on-site engagement** (keeping the
-visitor once they arrive), then emits one deterministic, evidence-backed report
-of findings plus prioritised fixes.
+An Agent Skill Marketplace that audits any website for **AI discoverability** (getting found and cited by assistants) and **on-site engagement** (keeping the visitor once they arrive), then emits one deterministic, evidence-backed report of findings plus prioritized fixes.
 
-Recommend-only. Nothing in this marketplace modifies a live site.
+**Recommend-only.** Nothing in this marketplace modifies a live site.
 
 ## Quick start
 
 ```bash
 python3 skills/audit-orchestrator/scripts/dispatch.py https://example.com \
-  | python3 skills/audit-orchestrator/scripts/merge.py - --audited-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  | python3 skills/audit-orchestrator/scripts/merge.py - \
+      --audited-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   | python3 skills/audit-orchestrator/scripts/validate_report.py -
 ```
 
-Python 3.9+. Standard library only. No third-party packages, no browser, no
-external service.
+Requirements:
 
-## The idea: audit the funnel, not a checklist
+- Python 3.9+
+- Standard library only
+- No third-party packages
+- No bundled browser
+- No external service required
 
-Discovery is a funnel, not a switch. A page can pass one stage and fail the
-next:
+## Architecture
 
+The marketplace follows a **"collector collects, specialists reason"** architecture.
+
+The entrypoint performs bounded, read-only network collection once and produces shared evidence. Specialist skills consume that evidence and perform independent analysis without making network requests.
+
+```text
+Website URL
+    │
+    ▼
+┌─────────────────────────────┐
+│ audit-orchestrator          │
+│ entrypoint / composition    │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│ evidence.py                 │
+│ shared bounded collection   │
+│ fetch + robots + sitemap    │
+│ page evidence + UA probe    │
+└─────────────┬───────────────┘
+              │
+              │ evidence.json
+              │
+       ┌──────┼──────────┐
+       ▼      ▼          ▼
+   crawl-   freshness-  engagement-
+   render   corroboration audit
+     │          │          │
+     └──────────┼──────────┘
+                ▼
+          merge.py
+                │
+                ▼
+       validate_report.py
+                │
+                ▼
+          Final JSON report
 ```
-exists -> reachable -> renderable -> extractable -> unambiguous
-       -> corroborated -> current -> engaging -> actionable
+
+This decomposition reflects the marketplace requirement for one designated entrypoint composing multiple focused skills. Each specialist has a distinct concern rather than duplicating the collection workflow.
+
+## The audit funnel
+
+Discovery is treated as a funnel rather than a single pass:
+
+```text
+exists
+  → reachable
+  → renderable
+  → extractable
+  → unambiguous
+  → corroborated
+  → current
+  → engaging
+  → actionable
 ```
 
-Every skill owns a **contiguous band** of that funnel. That is what makes the
-decomposition a separation of concerns rather than padding:
+Each specialist owns a contiguous analytical area:
 
-| Skill | Band | Question it answers |
+| Skill | Responsibility | Question |
 |---|---|---|
-| `crawl-render-audit` | reachable, renderable, extractable | Can a machine get in, read the page, and pick out a specific fact? |
-| `freshness-corroboration-audit` | unambiguous, corroborated, current | Is it clear which entity this is, when the claim was true, and does anything outside the site agree? |
-| `engagement-audit` | engaging | Once a visitor arrives, can they orient and find what they came for? |
-| `audit-orchestrator` | composition | Which of those failures are independent, how bad is each, and in what order should they be fixed? |
+| `crawl-render-audit` | Access, rendering and extraction | Can a machine reach the page, read it, and extract useful facts? |
+| `freshness-corroboration-audit` | Identity, freshness and corroboration | Is the entity clear, are claims time-aware, and are declared external references usable? |
+| `engagement-audit` | On-site engagement | Once a visitor arrives, can they orient themselves and find what they need? |
+| `audit-orchestrator` | Collection and composition | How should the specialist results be combined, gated, scored and reported? |
 
-Two consequences drive the whole design:
+A defect is attributed to the earliest stage that actually prevents the later measurement.
 
-1. **A defect belongs to the earliest stage it breaks.** A price missing because
-   `/products/` is disallowed is a *reachability* defect, not an extraction
-   defect.
-2. **Downstream findings behind an upstream blocker are not independent
-   defects.** Reporting them separately turns one root cause into four findings
-   and inflates the severity counts. The orchestrator gates them instead.
+Downstream findings that cannot be independently verified because of an upstream blocker are gated rather than reported as separate defects. Suppressed findings remain visible in the report with their blocker reference.
 
 ## What each skill does
 
-### `audit-orchestrator` (entrypoint)
+### `audit-orchestrator` — entrypoint
 
-Composes everything. It never checks a website itself.
+The entrypoint owns the audit workflow and final composition.
 
-- `scripts/dispatch.py` reads `marketplace.json`, builds the shared page sample,
-  runs every specialist through the contract, and isolates failures. A
-  specialist that crashes, times out, prints non-JSON or omits a contract field
-  becomes a well-formed `failure` result with a limitation, never an exception
-  that ends the audit.
-- `scripts/merge.py` deduplicates, gates, scores and numbers.
-- `scripts/validate_report.py` enforces the schema plus the invariants JSON
-  Schema cannot express.
-- `references/` holds the report schema, the severity model and the specialist
-  contract.
+- `scripts/evidence.py` performs the shared bounded network collection and builds canonical evidence.
+- `scripts/fetch.py` provides the low-level HTTP retrieval used by the collector.
+- `scripts/sitemap.py` discovers the bounded page sample.
+- `scripts/dispatch.py` runs the collector once and invokes each specialist against the same evidence.
+- `scripts/merge.py` deduplicates, gates, scores and numbers findings.
+- `scripts/validate_report.py` validates the final report schema and invariants.
+- `references/` contains the report schema, severity model and specialist contract.
+
+Specialists are isolated from the network collection layer. They receive the shared evidence through `--evidence-file`.
 
 ### `crawl-render-audit`
 
-Owns access and extraction. `robots.py` parses `robots.txt` per RFC 9309,
-preserves the matching rule and line number as evidence, and separates three
-outcomes that are usually conflated: allowed, disallowed, and *unknown* (a 5xx
-or network failure, after which crawling must not proceed). `fetch.py` performs
-bounded read-only retrieval and runs the user-agent differential probe.
-`sitemap.py` produces the shared sample. `render.py` is optional and honest
-about its own absence. `check.py` coordinates them.
+Owns machine accessibility, rendering and extraction analysis.
+
+It evaluates:
+
+- `robots.txt` accessibility decisions
+- HTTP retrieval failures
+- renderability and client-side dependence
+- machine-readable page content
+- structured data and extraction signals
+- crawl/sample coverage
+- browser-vs-assistant user-agent differential evidence
+
+`check.py` analyzes the evidence produced by the orchestrator. It does not perform its own network retrieval.
 
 ### `freshness-corroboration-audit`
 
-Owns trust. Declared identity, `sameAs` graph, self-consistent naming, date
-signals, and bounded verification that declared external profiles resolve.
+Owns identity, freshness and corroboration analysis.
+
+It evaluates:
+
+- declared identity
+- JSON-LD identity signals
+- naming consistency
+- date/freshness signals
+- declared `sameAs` references
+- bounded `sameAs` verification results already collected by `evidence.py`
+
+The specialist does **not** independently fetch `sameAs` URLs. It consumes the shared verification results from:
+
+```text
+evidence.site_level.corroboration.same_as_checked
+```
 
 ### `engagement-audit`
 
-Owns the post-arrival handoff. Deep-link anchors, blocking interstitials,
-content anchors, search recovery paths, crawlable navigation, breadcrumbs.
+Owns post-arrival engagement analysis.
 
-## How composition actually works
+It evaluates signals such as:
 
-Specialists share a data contract, not prose. Each emits:
+- deep-link anchors
+- content anchors
+- search recovery paths
+- crawlable navigation
+- breadcrumbs
+- blocking interstitial patterns
+- orientation/context signals
+
+Like the other specialists, it analyzes shared evidence rather than performing network collection.
+
+## How composition works
+
+All specialists return the same contract shape:
 
 ```json
-{ "skill": "...", "status": "...", "observations": [],
-  "findings": [], "limitations": [], "proactive_recommendations": [] }
+{
+  "skill": "...",
+  "status": "...",
+  "observations": [],
+  "findings": [],
+  "limitations": [],
+  "proactive_recommendations": []
+}
 ```
 
-The orchestrator then does four things no specialist can do alone.
+The orchestrator then combines those results.
 
-**Deduplicate.** Findings sharing a category, funnel stage and affected surface
-are one defect. Evidence is unioned, the wider `severity_inputs` win, the weaker
-`confidence` governs.
+### Collection
 
-**Gate.** Blocker reach depends on the blocker's kind. A **hard access failure**
-(403, 5xx, TLS, timeout) gates everything downstream, because nothing could be
-measured. A **policy block** (a `robots.txt` disallow) gates only the
-discoverability chain: the page is still served to human visitors, so its
-engagement defects remain directly observable and must still be reported.
-Suppressed items move to `suppressed_findings` with a `blocked_by` reference.
-Nothing is silently dropped.
+The shared collector gathers the bounded evidence once. Specialists receive the same evidence so their results are based on the same sampled pages and retrieval outcomes.
 
-**Score.** Severity is computed, never chosen:
+### Deduplication
 
+`merge.py` combines findings that represent the same underlying defect. Evidence and severity inputs are merged according to the severity model.
+
+### Gating
+
+Upstream blockers can suppress downstream findings that could not be independently verified.
+
+Hard access failures can block downstream analysis because the page could not be measured.
+
+A `robots.txt` policy block is treated differently: the page may still be available to human visitors, so directly observable engagement problems are not automatically suppressed.
+
+Suppressed findings are retained in `suppressed_findings` with a `blocked_by` reference.
+
+### Severity
+
+Specialists provide severity inputs rather than choosing the final severity.
+
+```text
+score = stage_block × fact_criticality × blast_radius
 ```
-score = stage_block x fact_criticality x blast_radius     (1..36)
-critical >= 27   high >= 14   medium >= 6   low < 6
+
+The orchestrator converts the score into:
+
+```text
+critical >= 27
+high     >= 14
+medium   >= 6
+low      < 6
 ```
 
-Specialists emit the three integers only. `confidence: medium` caps severity at
-`high`. `confidence: low` is not permitted on a finding and becomes a
-limitation. The full tables are in
-`skills/audit-orchestrator/references/severity-model.md`.
+Confidence can further cap the resulting severity. The complete model is defined in:
 
-**Order and number.** Sort by severity descending, then `stage_block`
-descending, then category, then first affected URL, then title, all
-lexicographic. Number `F001` onward afterwards. Identical inputs produce a
-byte-identical report.
+```text
+skills/audit-orchestrator/references/severity-model.md
+```
 
-## Design decisions worth knowing about
+### Deterministic ordering
 
-**One shared page sample.** `sitemap.py` picks 8 to 12 pages, round-robin across
-path roles so a store with 4000 product URLs does not yield a sample of nothing
-but product pages. Every specialist audits that same list, which is what makes
-`0 of 12 product pages` a comparable claim across skills and reproducible
-between runs. `blast_radius` follows the affected-to-sampled ratio and is never
-inferred from a single page.
+Final findings are sorted deterministically and numbered after merging. Identical evidence produces the same ordering and severity calculations.
 
-**Limitations are first-class.** A check that did not run is neither a defect
-nor a pass. Every incomplete check appears in `limitations`, and
-`summary.limitations_count` being non-zero means the report is incomplete, not
-that the site is clean.
+## Shared evidence and network access
 
-**No bundled browser.** Shipping one would break the size limit, the runtime
-budget and portability. `render.py` probes for a headless browser and reports
-`available: false` when there is none. Client-side dependence is then inferred
-from hydration markers and reported at **medium** confidence rather than
-asserted. Absence of a capability never manufactures a finding.
+There is **one collection layer**.
 
-**No search backend.** The marketplace does not query the open web to look for
-third-party contradictions, because that would make it dependent on an external
-service and non-reproducible. What it can establish is whether the site has made
-corroboration *possible*: a declared identity, resolvable external references,
-one consistent name, dated claims. The gap is stated as a limitation in every
-report rather than left as implied agreement.
+```text
+audit-orchestrator
+       │
+       ▼
+   evidence.py
+       │
+       ├── fetch.py
+       ├── robots.py
+       ├── sitemap.py
+       └── bounded collection
+              │
+              ▼
+         evidence.json
+              │
+       ┌──────┼──────┐
+       ▼      ▼      ▼
+    specialist check.py files
+```
 
-**False positives are designed against.** A consent banner is only a finding
-when a modal structure, consent vocabulary and a scroll lock appear together. A
-missing sitemap is never a defect by itself. Thin server HTML is an observation
-for `engagement-audit` and a finding only for `crawl-render-audit`, which owns
-rendering. An environment-specific 403 is never generalised to the whole site.
+`fetch.py` is **not duplicated into the specialist folders**.
+
+Each specialist is a standard-library-only Python module that receives the canonical evidence through its CLI `--evidence-file` argument. Specialists have no cross-folder Python imports and do not make network requests.
+
+This keeps network access centralized and makes the separation between collection and reasoning explicit.
+
+## Sampling
+
+The collector uses a bounded page sample rather than attempting to crawl an entire website.
+
+Where available, sitemap discovery provides candidate URLs. When sitemap discovery is unavailable and crawling is permitted, the collector can use bounded same-origin link discovery from the already retrieved homepage.
+
+When crawling is disallowed, the safe fallback is homepage-only analysis.
+
+The same shared page evidence is passed to every specialist, making their measurements comparable and reproducible.
+
+## Limitations are first-class
+
+A check that could not run is neither automatically a defect nor a pass.
+
+Incomplete checks are recorded in `limitations`.
+
+For example:
+
+- rendering may be unavailable when no supported browser exists;
+- external corroboration may be limited to declared `sameAs` references;
+- a blocked or failed page may prevent downstream verification.
+
+A non-zero `limitations_count` means the audit is incomplete; it does **not** mean the website is clean.
+
+## No external search backend
+
+The marketplace does not perform open-web search for third-party contradictions.
+
+External corroboration is limited to evidence the site itself declares, such as bounded `sameAs` references. The audit can determine whether those declared references resolve, but it does not claim that the wider web agrees with the site's claims.
+
+This keeps the audit deterministic and avoids a dependency on an external search service.
+
+## False-positive controls
+
+The checks are intentionally conservative.
+
+Examples:
+
+- a missing sitemap is not automatically treated as a defect;
+- missing rendering capability does not itself manufacture a rendering finding;
+- an environment-specific access failure is not automatically generalized to the entire site;
+- downstream checks are not reported when an upstream blocker prevents independent verification;
+- external corroboration limitations are reported as limitations rather than fabricated agreement.
 
 ## Report shape
 
-Schema: `skills/audit-orchestrator/references/schema.json`. It is a superset of
-the required floor.
+The final report is validated against:
 
-```
-site, audited_at, summary, findings                 <- required floor
-audit          marketplace, skills run, shared sample, duration
-findings[]     id, title, severity, evidence[], suggested_action{summary, priority,
-               rationale, effort, verify_by}, stage, category, confidence,
-               scope, affected_urls, severity_inputs, source_skill
-suppressed_findings   gated items with their blocker
-limitations           every check that could not be completed
-proactive_recommendations   improvements where no defect was found
+```text
+skills/audit-orchestrator/references/schema.json
 ```
 
-## Layout
+The required report floor includes:
 
+```text
+site
+audited_at
+summary
+findings[]
 ```
+
+Each finding contains the required:
+
+```text
+id
+title
+severity
+evidence
+suggested_action
+```
+
+The implementation may additionally provide:
+
+```text
+audit
+suppressed_findings
+limitations
+proactive_recommendations
+stage
+category
+confidence
+scope
+affected_urls
+severity_inputs
+source_skill
+```
+
+## Repository layout
+
+```text
 brand-ai-readiness-audit/
 ├── marketplace.json
 ├── README.md
 ├── UML_DIAGRAMS.md
 └── skills/
-    ├── audit-orchestrator/          <- entrypoint
+    ├── audit-orchestrator/
     │   ├── SKILL.md
-    │   ├── scripts/{dispatch,merge,validate_report}.py
-    │   └── references/{schema.json,severity-model.md,specialist-contract.md}
+    │   ├── scripts/
+    │   │   ├── dispatch.py
+    │   │   ├── evidence.py
+    │   │   ├── fetch.py
+    │   │   ├── merge.py
+    │   │   ├── sitemap.py
+    │   │   └── validate_report.py
+    │   └── references/
+    │       ├── schema.json
+    │       ├── severity-model.md
+    │       └── specialist-contract.md
+    │
     ├── crawl-render-audit/
     │   ├── SKILL.md
-    │   └── scripts/{check,robots,fetch,render,sitemap}.py
+    │   └── scripts/
+    │       └── check.py
+    │
     ├── freshness-corroboration-audit/
     │   ├── SKILL.md
-    │   └── scripts/{check,fetch}.py
+    │   └── scripts/
+    │       └── check.py
+    │
     └── engagement-audit/
         ├── SKILL.md
-        └── scripts/{check,fetch}.py
+        └── scripts/
+            └── check.py
 ```
-
-`fetch.py` is duplicated into each specialist so every skill folder is
-self-contained and independently valid against the agentskills.io spec, which is
-a requirement of the marketplace rules.
 
 ## Adding a specialist
 
-Add a folder with a `SKILL.md` and `scripts/check.py` that satisfies
-`references/specialist-contract.md`, then list it in `marketplace.json`. No
-orchestrator code changes.
+A new specialist should:
+
+1. Have its own `SKILL.md`.
+2. Provide a `scripts/check.py`.
+3. Follow `references/specialist-contract.md`.
+4. Consume the shared evidence through `--evidence-file`.
+5. Avoid independent network collection.
+6. Be registered in `marketplace.json`.
+
+The entrypoint should remain responsible for collection and composition.
 
 ## Safety
 
-Read-only, GET only, TLS verified, bounded bytes, redirects and time, polite
-delays, `robots.txt` respected before any retrieval. Never authenticates, never
-bypasses a CAPTCHA, WAF, paywall or consent wall. A consent wall is detected by
-reading markup, never by dismissing it. Off-origin requests are limited to at
-most three public `sameAs` URLs the site itself declares.
+The marketplace is designed to be read-only and recommend-only.
+
+- Network retrieval is bounded.
+- Only permitted public web retrieval is performed.
+- `robots.txt` is respected.
+- No authentication is attempted.
+- No CAPTCHA, WAF, paywall or access-control bypass is attempted.
+- No destructive or site-altering action is performed.
+- No live website is modified.
+- Off-origin requests are limited to bounded `sameAs` URLs explicitly declared by the audited site.
+- The audit is designed to remain within the contest's runtime and package-size constraints.

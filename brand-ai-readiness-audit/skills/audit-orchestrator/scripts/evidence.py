@@ -74,6 +74,32 @@ SEARCH_UI_HINTS = re.compile(
     r'type=["\']search["\']|name=["\'](?:q|query|search)["\']|role=["\']search["\']',
     re.IGNORECASE,
 )
+ 
+NOINDEX_META = re.compile(
+    r'<meta[^>]+name=["\'](?:robots|googlebot|bingbot)["\'][^>]+content=["\']([^"\']*)["\']',
+    re.IGNORECASE,
+)
+ 
+ 
+def page_excluded_from_indexing(html_text: str, x_robots_tag: Optional[str]) -> bool:
+    """
+   True if the page carries a noindex directive via <meta name="robots"|
+    "googlebot"|"bingbot"> or the X-Robots-Tag response header. This is a
+    page-level exclusion signal, independent of robots.txt, and must be
+    respected the same way: analyzed content must not be reported as a
+   citable/engaging page if the site has explicitly excluded it from
+    indexing.
+    """
+    if x_robots_tag and "noindex" in x_robots_tag.lower():
+        return True
+    for match in NOINDEX_META.finditer(html_text):
+        if "noindex" in match.group(1).lower():
+            return True
+    return False
+
+ 
+ # ---------------------------------------------------------------------------
+ # Sibling module loading (same pattern used throughout this marketplace)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +597,17 @@ def collect(
             continue
 
         body = result["body"]
+        excluded = page_excluded_from_indexing(body, result.get("x_robots_tag"))
+        page["indexable"] = not excluded
+        if excluded:
+            page["limitations"].append(
+                "Page carries a noindex directive (meta robots or X-Robots-Tag); "
+                "retrieved for permission-checking only and excluded from "
+                "content-based analysis, per the marketplace's obligation to "
+                "respect page-level indexing directives, not just robots.txt."
+            )
+            pages.append(page)
+            continue
         text = visible_text(body)
         jsonld = extract_jsonld(body)
         og = extract_open_graph(body)

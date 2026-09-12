@@ -83,6 +83,7 @@ class FetchResult:
     redirect_chain: list = field(default_factory=list)
     content_type: Optional[str] = None
     content_encoding: Optional[str] = None
+    x_robots_tag: Optional[str] = None
     body: Optional[str] = None
     bytes: int = 0
     truncated: bool = False
@@ -97,6 +98,7 @@ class FetchResult:
             "redirect_chain": self.redirect_chain,
             "content_type": self.content_type,
             "content_encoding": self.content_encoding,
+            "x_robots_tag": self.x_robots_tag,
             "body": self.body,
             "bytes": self.bytes,
             "truncated": self.truncated,

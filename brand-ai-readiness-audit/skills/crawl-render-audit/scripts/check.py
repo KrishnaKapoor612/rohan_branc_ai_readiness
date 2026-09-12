@@ -189,6 +189,49 @@ def stage_robots(evidence: dict, state: dict) -> None:
                 "have robots_allowed=true."
             ),
         ))
+    noindex_pages = [
+        page for page in pages
+        if page.get("indexable") is False
+    ]
+
+    if noindex_pages:
+        affected_urls = sorted(
+            page.get("url")
+            for page in noindex_pages
+            if page.get("url")
+        )
+
+        state["findings"].append(finding(
+            local_id="CR-007",
+            title="Sampled pages carry a page-level noindex directive",
+            category="crawl_policy",
+            stage="reachable",
+            evidence=[
+                f"{url}: excluded via meta robots or X-Robots-Tag noindex directive."
+                for url in affected_urls
+            ],
+            stage_block=4,
+            fact_criticality=3,
+            blast_radius=2 if len(affected_urls) > 1 else 1,
+            scope="section" if len(affected_urls) > 1 else "single_page",
+            affected_urls=affected_urls,
+            action_summary=(
+                "Remove the noindex directive from pages that should be "
+                "discoverable, or confirm it is intentional for pages that "
+                "should stay out of AI/search systems entirely."
+            ),
+            action_rationale=(
+                "A page a crawler can technically reach but has been told "
+                "not to index is invisible to citation-driven assistants "
+                "the same way a robots.txt block is — the exclusion is "
+                "just declared at the page level instead of the site level."
+            ),
+            effort="low",
+            verify_by=(
+                "Re-run the audit and confirm the affected sampled URLs "
+                "have indexable=true."
+            ),
+        ))
 
     ai_directives = robots.get("ai_agent_directives") or []
     blocked_agents = [

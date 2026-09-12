@@ -139,6 +139,9 @@ Prefer evidence that states:
 - what was present or absent;
 - the difference between initial and rendered content when relevant;
 - measurable counts or comparisons where available.
+- whether a sampled page carries a page-level noindex directive (meta
+  robots or X-Robots-Tag), which excludes it from content-based analysis
+  even when it was successfully retrieved.
 
 Do not infer a website-wide condition from a single environment-specific failure.
 
@@ -164,7 +167,9 @@ Examples:
 - If rendering fails, report that rendered content could not be verified.
 - If a CAPTCHA or anti-bot challenge prevents inspection, report that the content could not be inspected through the permitted audit.
 - If access is restricted from the audit environment, describe the observed restriction without generalizing it to all users or locations.
-
+- If a sampled page carries a noindex directive, report it as a page-level
+  exclusion (`CR-007`), not a retrieval failure — the page was successfully
+  fetched, it has simply opted out of indexing.
 
 ## Scope Boundaries
 

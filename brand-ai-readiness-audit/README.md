@@ -344,7 +344,6 @@ source_skill
 brand-ai-readiness-audit/
 ├── marketplace.json
 ├── README.md
-├── UML_DIAGRAMS.md
 └── skills/
     ├── audit-orchestrator/
     │   ├── SKILL.md

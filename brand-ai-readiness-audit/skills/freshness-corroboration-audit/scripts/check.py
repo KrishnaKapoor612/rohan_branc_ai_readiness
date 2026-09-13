@@ -124,7 +124,9 @@ def analyze_identity(url: str, page: dict) -> dict:
     og_site_name = open_graph.get("og:site_name")
     if not isinstance(og_site_name, str) or not og_site_name.strip():
         og_site_name = None
-
+        title_signal = page.get("title")
+    if not isinstance(title_signal, str) or not title_signal.strip():
+        title_signal = None
     # Keep the shared normalized same_as list authoritative if present.
     page_same_as = page.get("same_as")
     if isinstance(page_same_as, list):
@@ -152,6 +154,7 @@ def analyze_identity(url: str, page: dict) -> dict:
         "identity_entities": identity_entities,
         "same_as": sorted(same_as),
         "og_site_name": og_site_name,
+        "title_signal": title_signal,
         "has_date_signal": bool(date_signals),
         "time_sensitive": time_sensitive,
         "text_chars": int(text_chars),
@@ -221,6 +224,7 @@ def evaluate(analyses: dict, origin: str, state: dict) -> list[str]:
         if analyses[u]["identity_nodes"] > 0
         or analyses[u]["og_site_name"]
         or analyses[u]["identity_names"]
+         or analyses[u]["title_signal"]
     ]
     # --- 1. No declared identity -----------------------------------------
     if not identity_pages_incl_metadata:

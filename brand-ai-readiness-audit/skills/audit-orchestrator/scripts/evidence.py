@@ -301,6 +301,86 @@ def extract_links(html_text: str, base_url: str) -> dict:
 
     return {"internal_count": internal, "external_count": external, "sample": sample}
 
+def discover_same_origin_bfs(
+    fetch,
+    start_url: str,
+    origin: str,
+    limit: int,
+    timeout: float,
+    user_agent: str,
+    robots_allowed_for,
+) -> tuple[list[str], dict[str, dict]]:
+    """Bounded same-origin BFS fallback when no usable sitemap sample exists."""
+    sample_urls = []
+    prefetched = {}
+    queue = [start_url]
+    seen = set()
+
+    skip_extensions = {
+        ".css", ".js", ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        ".svg", ".ico", ".pdf", ".zip", ".mp3", ".mp4", ".avi",
+        ".mov", ".woff", ".woff2", ".ttf", ".eot", ".xml", ".json",
+    }
+
+    while queue and len(sample_urls) < limit:
+        current = queue.pop(0)
+
+        if current in seen:
+            continue
+        seen.add(current)
+
+        if robots_allowed_for(current) is not True:
+            continue
+
+        try:
+            result = fetch.fetch_page(
+                current,
+                user_agent=user_agent,
+                timeout=timeout,
+                max_bytes=MAX_FETCH_BYTES_PER_PAGE,
+            )
+        except Exception:
+            continue
+
+        prefetched[current] = result
+        sample_urls.append(current)
+
+        if result.get("outcome") != "retrieved":
+            continue
+
+        body = result.get("body") or ""
+        content_type = (result.get("content_type") or "").lower()
+
+        if content_type and "html" not in content_type:
+            continue
+
+        for link in extract_links(body, current).get("sample", []):
+            if not link.get("internal"):
+                continue
+
+            candidate = link.get("href", "")
+            if not candidate:
+                continue
+
+            parts = urlsplit(candidate)
+
+            if parts.scheme not in {"http", "https"}:
+                continue
+
+            if parts.netloc != origin:
+                continue
+
+            path = parts.path.lower()
+
+            if any(path.endswith(ext) for ext in skip_extensions):
+                continue
+
+            normalized = candidate.split("#", 1)[0]
+
+            if normalized not in seen and normalized not in queue:
+                queue.append(normalized)
+
+    return sample_urls, prefetched
 
 def extract_date_signals(html_text: str, jsonld: list[dict]) -> list[dict]:
     signals = []
@@ -503,9 +583,44 @@ def collect(
         allowed, _rule = robots.evaluate_path(group, path)
         return allowed
 
+
+    ua_differential = {"attempted": False}
+
+    primary_url = origin + "/"
+    primary_allowed = robots_allowed_for(primary_url)
+
+    if (
+        fetch is not None
+        and hasattr(fetch, "probe_user_agents")
+        and primary_allowed is True
+    ):
+        try:
+            ua_differential = fetch.probe_user_agents(
+                primary_url,
+                timeout=timeout,
+            )
+            ua_differential["attempted"] = True
+        except Exception as exc:
+            ua_differential = {
+                "attempted": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            limitations.append({
+                "check": "ua_differential",
+                "reason": (
+                    "User-agent differential probe failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "affected_checks": ["ai_agent_access"],
+            })
+
+
+    
     # -- Sample: reuse sitemap.discover() directly, passing the sitemaps we
     #    already found so it does not re-fetch robots.txt itself. -----------
     sample_urls = [origin + "/"]
+
+    prefetched_results: dict[str, dict] = {}
     site_sitemap_evidence: dict = {"documents_read": 0, "url_count_available": 0,
                                     "truncated": False, "strategy": "Homepage only."}
 
@@ -551,6 +666,43 @@ def collect(
             "affected_checks": ["page_sample"],
         })
 
+    sitemap_sample_usable = (
+        len(sample_urls) > 1
+        and site_sitemap_evidence.get("url_count_available", 0) > 0
+    )
+
+    if (
+        not sitemap_sample_usable
+        and robots_allowed_for(origin + "/") is True
+        and fetch is not None
+    ):
+        try:
+            bfs_urls, prefetched_results = discover_same_origin_bfs(
+                fetch=fetch,
+                start_url=origin + "/",
+                origin=urlsplit(origin).netloc,
+                limit=limit,
+                timeout=timeout,
+                user_agent=user_agent,
+                robots_allowed_for=robots_allowed_for,
+            )
+
+            if bfs_urls:
+                sample_urls = bfs_urls
+                site_sitemap_evidence["strategy"] = (
+                    "Homepage + same-origin link BFS."
+                )
+                site_sitemap_evidence["url_count_available"] = len(bfs_urls)
+        except Exception as exc:
+            limitations.append({
+                "check": "page_sample",
+                "reason": (
+                    "Same-origin link BFS failed: "
+                    f"{type(exc).__name__}: {exc}. "
+                    "Falling back to the homepage only."
+                ),
+                "affected_checks": ["page_sample"],
+            })
     # -- Per-page collection --------------------------------------------------
     pages: list[dict] = []
     same_as_candidates: set[str] = set()
@@ -579,8 +731,14 @@ def collect(
             pages.append(page)
             continue
 
-        result = fetch.fetch_page(page_url, user_agent=user_agent, timeout=timeout,
-                                  max_bytes=MAX_FETCH_BYTES_PER_PAGE)
+        result = prefetched_results.pop(page_url, None)
+        if result is None:
+            result = fetch.fetch_page(
+                page_url,
+                user_agent=user_agent,
+                timeout=timeout,
+                max_bytes=MAX_FETCH_BYTES_PER_PAGE,
+            )
         page["final_url"] = result.get("final_url")
         page["status"] = result.get("http_status")
         page["content_type"] = result.get("content_type")
@@ -686,6 +844,7 @@ def collect(
         "origin": origin,
         "robots": site_robots_evidence,
         "sitemap": site_sitemap_evidence,
+        "ua_differential": ua_differential,
         "corroboration": {
             "same_as_candidates_found": len(same_as_candidates),
             "same_as_checked": same_as_checks,

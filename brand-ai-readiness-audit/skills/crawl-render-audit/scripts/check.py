@@ -353,6 +353,76 @@ def detect_primary_access_failure(evidence: dict, state: dict) -> None:
         ),
     ))
 
+def detect_ua_differential(evidence: dict, state: dict) -> None:
+    """Report clear homepage differences between browser and AI user agents."""
+    if any(
+        finding.get("local_id") == "CR-000"
+        for finding in state.get("findings", [])
+    ):
+        return
+
+    site_level = evidence.get("site_level") or {}
+    ua = site_level.get("ua_differential") or {}
+
+    if not ua.get("attempted"):
+        return
+
+    if not ua.get("browser_baseline_ok"):
+        return
+
+    blocked = ua.get("blocked_labels") or []
+    reduced = ua.get("reduced_content_labels") or []
+
+    if not blocked and not reduced:
+        return
+
+    url = ua.get("url") or site_level.get("origin") or ""
+
+    evidence_items = []
+
+    if blocked:
+        evidence_items.append(
+            "Non-browser user-agent probes returned non-200 responses: "
+            + ", ".join(sorted(blocked))
+        )
+
+    if reduced:
+        evidence_items.append(
+            "Non-browser user-agent probes returned less than 50% "
+            "of the browser response size: "
+            + ", ".join(sorted(reduced))
+        )
+
+    state["findings"].append(
+        finding(
+            local_id="CR-008",
+            title="AI-facing user-agent receives different homepage access",
+            category="crawl_policy",
+            stage="reachable",
+            evidence=evidence_items,
+            stage_block=4,
+            fact_criticality=3,
+            blast_radius=2 if reduced and not blocked else 3,
+            scope="site_wide",
+            affected_urls=[url],
+            action_summary=(
+                "Review edge, CDN, or WAF rules so permitted AI crawlers "
+                "receive the public homepage content intended for discovery."
+            ),
+            action_rationale=(
+                "A site may allow a crawler in robots.txt while still "
+                "serving that crawler a block or substantially thinner "
+                "response at the edge."
+            ),
+            effort="medium",
+            verify_by=(
+                "Re-run the audit and confirm that the browser and "
+                "permitted AI-crawler probes both return successful, "
+                "materially equivalent homepage responses."
+            ),
+        )
+    )
+    
 def stage_retrieval(evidence: dict, state: dict) -> None:
     """Reason about page retrieval outcomes already collected."""
 
@@ -718,6 +788,7 @@ def run(
         return finalize(state)
     
     detect_primary_access_failure(evidence, state)
+    detect_ua_differential(evidence, state)
     stage_robots(evidence, state)
     stage_retrieval(evidence, state)
     stage_extractability(evidence, state)

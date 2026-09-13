@@ -37,7 +37,7 @@ from typing import Optional
 
 DEFAULT_USER_AGENT = (
     "BrandAIReadinessAuditBot/1.0 "
-    "(+https://github.com/KrishnaKapoor612/brand-ai-readiness-audit)"
+    "(+https://github.com/KrishnaKapoor612/rohan_branc_ai_readiness)"
 )
 
 # A mainstream browser string and a well-known assistant crawler string.
